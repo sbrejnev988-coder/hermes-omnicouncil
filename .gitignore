@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local/runtime artifacts
+.cache/
+.env
+*.env
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+
+# Backups and generated reports
+*.bak
+*.bak-*
+*.bak_*
+backups/
+.patch_backups/
+reports/
+exports/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

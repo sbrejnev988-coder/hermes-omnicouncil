@@ -15,18 +15,22 @@ import sqlite3
 import time
 import urllib.parse
 import urllib.request
+import urllib.robotparser
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 BASE_DIR = Path.home() / ".hermes" / "cache" / "hermes-omnicouncil" / "research"
 DB_PATH = BASE_DIR / "research.db"
 REPORT_DIR = BASE_DIR / "reports"
 CACHE_DIR = BASE_DIR / "http-cache"
-USER_AGENT = "HermesDeepWebResearch/1.1 (+https://local.hermes)"
+USER_AGENT = "HermesDeepWebResearch/1.2 (+https://local.hermes; respects robots.txt)"
 MAX_FETCH_BYTES = 2_000_000
+DOMAIN_LAST_FETCH: dict[str, float] = {}
+ROBOTS_CACHE: dict[str, tuple[float, urllib.robotparser.RobotFileParser]] = {}
+DEFAULT_RATE_LIMIT_SECONDS = 1.0
 
 PRESETS = {
     "fast": {"max_pages": 8, "max_depth": 1, "timeout": 8, "external_link_budget": 2},
@@ -60,9 +64,12 @@ SCHEMA = {
             "same_domain_only": {"type": "boolean", "default": False},
             "cache_ttl_seconds": {"type": "integer", "default": 86400},
             "force_refresh": {"type": "boolean", "default": False},
+            "respect_robots": {"type": "boolean", "default": True, "description": "Check robots.txt before fetching non-cache pages."},
+            "rate_limit_seconds": {"type": "number", "default": 1.0, "description": "Minimum delay between live fetches to the same domain."},
             "timeout": {"type": "integer", "default": 0},
             "export_formats": {"type": "array", "items": {"type": "string", "enum": ["markdown", "html", "json"]}, "default": ["markdown", "html"]},
             "include_raw": {"type": "boolean", "default": False, "description": "Include crawled page excerpts in result JSON."},
+            "memory_wiki_task_capsule": {"type": "boolean", "default": False, "description": "Return a sanitized optional memory-wiki task capsule payload without raw page text."},
             "job_id": {"type": "string", "default": "", "description": "Resume/update an existing job id; empty creates deterministic id."},
         },
         "required": ["query"],
@@ -187,7 +194,7 @@ def _db() -> sqlite3.Connection:
             page_id TEXT PRIMARY KEY, job_id TEXT, source_id TEXT, url TEXT,
             depth INTEGER, fetched_at REAL, status INTEGER, title TEXT, text TEXT,
             summary TEXT, links_json TEXT, error TEXT,
-            relevance REAL DEFAULT 0.0, word_count INTEGER DEFAULT 0,
+            relevance REAL DEFAULT 0.0, credibility REAL DEFAULT 0.0, canonical_url TEXT, content_hash TEXT, citations_json TEXT DEFAULT '[]', word_count INTEGER DEFAULT 0,
             UNIQUE(job_id, url)
         );
         CREATE TABLE IF NOT EXISTS http_cache(
@@ -206,6 +213,10 @@ def _db() -> sqlite3.Connection:
     for ddl in [
         "ALTER TABLE pages ADD COLUMN relevance REAL DEFAULT 0.0",
         "ALTER TABLE pages ADD COLUMN word_count INTEGER DEFAULT 0",
+        "ALTER TABLE pages ADD COLUMN credibility REAL DEFAULT 0.0",
+        "ALTER TABLE pages ADD COLUMN canonical_url TEXT",
+        "ALTER TABLE pages ADD COLUMN content_hash TEXT",
+        "ALTER TABLE pages ADD COLUMN citations_json TEXT DEFAULT '[]'",
     ]:
         try:
             con.execute(ddl)
@@ -262,13 +273,115 @@ class PageParser(HTMLParser):
         return _redact(re.sub(r"\s+", " ", " ".join(self.text_parts)).strip())
 
 
-def _fetch(url: str, timeout: int, cache_ttl_seconds: int, force_refresh: bool, con: sqlite3.Connection) -> dict[str, Any]:
+def _canonical_url(url: str) -> str:
+    """Normalize a URL for source deduplication without changing fetch URL."""
+    clean = _clean_url(url)
+    if not clean:
+        return ""
+    p = urllib.parse.urlsplit(clean)
+    path = re.sub(r"/index\.(html?|php)$", "/", p.path or "/", flags=re.I)
+    if path != "/":
+        path = path.rstrip("/")
+    q = [(k, v) for k, v in urllib.parse.parse_qsl(p.query, keep_blank_values=False) if k.lower() not in {"replytocom", "share"}]
+    return urllib.parse.urlunsplit((p.scheme, p.netloc.lower(), path or "/", urllib.parse.urlencode(q), ""))
+
+
+def _content_hash(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", (text or "").lower()).strip()[:100_000]
+    return _hash(normalized) if normalized else ""
+
+
+def _is_probably_duplicate(con: sqlite3.Connection, job_id: str, canonical_url: str, content_hash: str) -> bool:
+    row = con.execute(
+        "SELECT 1 FROM pages WHERE job_id=? AND (canonical_url=? OR (content_hash<>'' AND content_hash=?)) LIMIT 1",
+        (job_id, canonical_url, content_hash),
+    ).fetchone()
+    return bool(row)
+
+
+def _rate_limit(url: str, seconds: float) -> None:
+    if seconds <= 0:
+        return
+    dom = _domain(url)
+    last = DOMAIN_LAST_FETCH.get(dom, 0.0)
+    wait = seconds - (_now() - last)
+    if wait > 0:
+        time.sleep(min(wait, 10.0))
+    DOMAIN_LAST_FETCH[dom] = _now()
+
+
+def _robots_allowed(url: str, timeout: int, cache_ttl_seconds: int, con: sqlite3.Connection) -> tuple[bool, str]:
+    clean = _clean_url(url)
+    if not clean:
+        return False, "invalid_url"
+    p = urllib.parse.urlsplit(clean)
+    robots_url = urllib.parse.urlunsplit((p.scheme, p.netloc, "/robots.txt", "", ""))
+    now = _now()
+    cached = ROBOTS_CACHE.get(robots_url)
+    if cached and now - cached[0] <= cache_ttl_seconds:
+        rp = cached[1]
+    else:
+        rp = urllib.robotparser.RobotFileParser()
+        rp.set_url(robots_url)
+        try:
+            fetched = _fetch(robots_url, max(2, min(timeout, 10)), max(cache_ttl_seconds, 3600), False, con, respect_robots=False, rate_limit_seconds=0)
+            rp.parse((fetched.get("body") or "").splitlines())
+        except Exception:
+            rp.parse([])
+        ROBOTS_CACHE[robots_url] = (now, rp)
+    try:
+        allowed = rp.can_fetch(USER_AGENT, clean)
+    except Exception:
+        allowed = True
+    return bool(allowed), robots_url
+
+
+def _extract_citations(text: str, query: str, limit: int = 5) -> list[dict[str, Any]]:
+    terms = _terms(query)
+    out: list[dict[str, Any]] = []
+    sentences = re.split(r"(?<=[.!?])\s+", (text or "")[:50_000])
+    for s in sentences[:260]:
+        ss = s.strip()
+        if len(ss) < 50:
+            continue
+        score = sum(1 for t in terms if t in ss.lower())
+        if score <= 0:
+            continue
+        out.append({"quote": _redact(ss[:360]), "score": score})
+    out.sort(key=lambda x: (int(x["score"]), len(x["quote"])), reverse=True)
+    return out[:limit]
+
+
+def _memory_capsule(job: sqlite3.Row, pages: list[sqlite3.Row], paths: dict[str, str]) -> dict[str, Any]:
+    ranked = sorted(pages, key=lambda p: (float(p["relevance"] or 0), float(p["credibility"] or 0)), reverse=True)
+    return {
+        "intent": f"deep_web_crawl research report for: {job['query']}",
+        "topic": "deep_web_crawl",
+        "plan": "Bounded crawler with deduplicated sources, credibility scoring, robots/rate-limit safety, cache and markdown/html reports.",
+        "files": list(paths.values()),
+        "commands": [],
+        "errors": [],
+        "fixes": [],
+        "verification": f"Collected {job['pages_done']}/{job['pages_target']} pages; no raw page text included in capsule.",
+        "followups": ["Verify critical claims against primary sources before acting."],
+        "sources": [
+            {"url": p["url"], "title": p["title"], "relevance": p["relevance"], "credibility": p["credibility"], "summary": (p["summary"] or "")[:500]}
+            for p in ranked[:20]
+        ],
+    }
+
+def _fetch(url: str, timeout: int, cache_ttl_seconds: int, force_refresh: bool, con: sqlite3.Connection, respect_robots: bool = True, rate_limit_seconds: float = DEFAULT_RATE_LIMIT_SECONDS) -> dict[str, Any]:
     url = _clean_url(url)
     uh = _hash(url)
     if not force_refresh and cache_ttl_seconds > 0:
         row = con.execute("SELECT * FROM http_cache WHERE url_hash=?", (uh,)).fetchone()
         if row and _now() - float(row["fetched_at"] or 0) <= cache_ttl_seconds:
             return {"url": url, "status": row["status"], "content_type": row["content_type"], "body": row["body"] or "", "error": row["error"] or "", "cached": True}
+    if respect_robots:
+        allowed, robots_url = _robots_allowed(url, timeout, cache_ttl_seconds, con)
+        if not allowed:
+            return {"url": url, "status": 0, "content_type": "", "body": "", "error": f"blocked_by_robots: {robots_url}", "cached": False, "robots_blocked": True}
+    _rate_limit(url, rate_limit_seconds)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,text/plain,application/json;q=0.8,*/*;q=0.2"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -381,11 +494,17 @@ def _credibility(url: str, status: int, text: str) -> float:
         score += 0.08
     if status == 200:
         score += 0.1
-    if d.endswith(('.gov', '.edu', '.ac.uk')) or any(x in d for x in ["wikipedia.org", "arxiv.org", "ietf.org", "who.int", "un.org", "europa.eu"]):
-        score += 0.18
-    if any(x in d for x in ["reddit.com", "x.com", "twitter.com", "facebook.com", "tiktok.com"]):
-        score -= 0.12
+    if d.endswith(('.gov', '.edu', '.ac.uk', '.mil')) or any(x in d for x in ["wikipedia.org", "arxiv.org", "ietf.org", "who.int", "un.org", "europa.eu", "nasa.gov", "nih.gov", "nature.com", "science.org"]):
+        score += 0.2
+    if any(x in d for x in ["github.com", "gitlab.com", "docs.python.org", "developer.mozilla.org"]):
+        score += 0.08
+    if any(x in d for x in ["reddit.com", "x.com", "twitter.com", "facebook.com", "tiktok.com", "pinterest.com"]):
+        score -= 0.14
+    if any(x in d for x in ["medium.com", "substack.com", "wordpress.com", "blogspot.com"]):
+        score -= 0.04
     wc = len(re.findall(r"\w+", text or ""))
+    if re.search(r"\b(references|bibliography|doi:|abstract|methodology|white paper|technical report)\b", text or "", re.I):
+        score += 0.08
     if wc > 500:
         score += 0.06
     if wc < 80:
@@ -425,28 +544,31 @@ def _progress_bar(done: int, total: int, width: int = 24) -> str:
     return "[" + "█" * filled + "░" * (width - filled) + f"] {round(100 * min(done, total) / total)}%"
 
 
-def _store_page(con: sqlite3.Connection, job_id: str, url: str, depth: int, fetched: dict[str, Any], title: str, text: str, summary: str, links: list[str], query: str) -> tuple[float, float, int]:
-    source_id = _hash(url)
+def _store_page(con: sqlite3.Connection, job_id: str, url: str, depth: int, fetched: dict[str, Any], title: str, text: str, summary: str, links: list[str], query: str) -> tuple[float, float, int, bool]:
+    canonical_url = _canonical_url(url) or url
+    content_hash = _content_hash(text)
+    duplicate = _is_probably_duplicate(con, job_id, canonical_url, content_hash)
+    source_id = _hash(canonical_url)
     dom = _domain(url)
     status = fetched.get("status") or 0
     word_count = len(re.findall(r"\w+", text or ""))
     relevance = _relevance_score(title, text, url, query)
     credibility = _credibility(url, int(status), text)
+    citations = _extract_citations(text, query)
     con.execute(
         "INSERT INTO sources(source_id,url,domain,first_seen,last_seen,title,status,content_type,credibility,notes) VALUES(?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(url) DO UPDATE SET last_seen=excluded.last_seen,title=excluded.title,status=excluded.status,content_type=excluded.content_type,credibility=excluded.credibility",
-        (source_id, url, dom, _now(), _now(), title, status, fetched.get("content_type") or "", credibility, ""),
+        (source_id, canonical_url, dom, _now(), _now(), title, status, fetched.get("content_type") or "", credibility, "canonical source"),
     )
     con.execute(
-        "INSERT OR REPLACE INTO pages(page_id,job_id,source_id,url,depth,fetched_at,status,title,text,summary,links_json,error,relevance,word_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (_hash(job_id + "\n" + url), job_id, source_id, url, depth, _now(), status, title, text, summary, json.dumps(links, ensure_ascii=False), fetched.get("error") or "", relevance, word_count),
+        "INSERT OR REPLACE INTO pages(page_id,job_id,source_id,url,depth,fetched_at,status,title,text,summary,links_json,error,relevance,credibility,canonical_url,content_hash,citations_json,word_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (_hash(job_id + "\n" + canonical_url), job_id, source_id, url, depth, _now(), status, title, text, summary, json.dumps(links, ensure_ascii=False), fetched.get("error") or "", relevance, credibility, canonical_url, content_hash, json.dumps(citations, ensure_ascii=False), word_count),
     )
     con.commit()
-    return relevance, credibility, word_count
-
+    return relevance, credibility, word_count, duplicate
 
 def _render_markdown(job: sqlite3.Row, pages: list[sqlite3.Row], events: list[sqlite3.Row], search_meta: dict[str, Any] | None = None) -> str:
-    ranked = sorted(pages, key=lambda p: (float(p["relevance"] or 0), int(p["word_count"] or 0)), reverse=True)
+    ranked = sorted(pages, key=lambda p: (float(p["relevance"] or 0), float(p["credibility"] or 0), int(p["word_count"] or 0)), reverse=True)
     source_count = len(pages)
     domains = sorted({_domain(p["url"]) for p in pages if _domain(p["url"])})
     lines = [
@@ -459,7 +581,7 @@ def _render_markdown(job: sqlite3.Row, pages: list[sqlite3.Row], events: list[sq
         f"- Updated: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(job['updated_at'] or _now()))}", "",
         "## Methodology", "",
         "- Discovery used keyless web endpoints (configured search engines) plus user-provided seed URLs.",
-        "- Crawl frontier was bounded by preset page/depth limits, cache TTL and external-link budget.",
+        "- Crawl frontier was bounded by preset page/depth limits, cache TTL, external-link budget, robots.txt checks, per-domain rate limiting and timeouts.",
         "- Each page was normalized, redacted for common secret patterns, scored for query relevance and source credibility, then persisted in SQLite.",
         "- This report is extractive: it cites collected pages and highlights sentences matching the query; verify critical claims against primary sources.", "",
     ]
@@ -476,19 +598,29 @@ def _render_markdown(job: sqlite3.Row, pages: list[sqlite3.Row], events: list[sq
         for i, p in enumerate(ranked[:12], 1):
             title = p["title"] or p["url"]
             rel = float(p["relevance"] or 0)
-            lines.append(f"{i}. **{title}** — relevance `{rel:.2f}` — {p['summary'] or 'No summary.'} [source]({p['url']})")
-    lines += ["", "## Source table", "", "| # | Relevance | Words | HTTP | Source |", "|---:|---:|---:|---:|---|"]
+            cred = float(p["credibility"] or 0)
+            lines.append(f"{i}. **{title}** — relevance `{rel:.2f}` credibility `{cred:.2f}` — {p['summary'] or 'No summary.'} [source]({p['url']})")
+    lines += ["", "## Source table", "", "| # | Relevance | Credibility | Words | HTTP | Domain | Source |", "|---:|---:|---:|---:|---:|---|---|"]
     for i, p in enumerate(ranked, 1):
         title = (p["title"] or p["url"]).replace("|", " ")[:120]
-        lines.append(f"| {i} | {float(p['relevance'] or 0):.2f} | {int(p['word_count'] or 0)} | {p['status']} | [{title}]({p['url']}) |")
+        lines.append(f"| {i} | {float(p['relevance'] or 0):.2f} | {float(p['credibility'] or 0):.2f} | {int(p['word_count'] or 0)} | {p['status']} | `{_domain(p['url'])}` | [{title}]({p['url']}) |")
     lines += ["", "## Source notes", ""]
     for i, p in enumerate(ranked, 1):
         lines += [
             f"### {i}. {p['title'] or p['url']}", "",
             f"- URL: {p['url']}",
-            f"- Domain: `{_domain(p['url'])}` | Depth: {p['depth']} | HTTP: {p['status']} | Relevance: {float(p['relevance'] or 0):.2f} | Words: {int(p['word_count'] or 0)}", "",
+            f"- Domain: `{_domain(p['url'])}` | Depth: {p['depth']} | HTTP: {p['status']} | Relevance: {float(p['relevance'] or 0):.2f} | Credibility: {float(p['credibility'] or 0):.2f} | Words: {int(p['word_count'] or 0)}", "",
             p["summary"] or "No extractive summary available.", "",
         ]
+        try:
+            citations = json.loads(p["citations_json"] or "[]")
+        except Exception:
+            citations = []
+        if citations:
+            lines += ["**Extracted citations:**", ""]
+            for c in citations[:5]:
+                lines.append(f"> {str(c.get('quote', '')).replace(chr(10), ' ')}")
+            lines.append("")
     lines += ["", "## Limitations", "", "- Dynamic pages, paywalls, robots/network restrictions, CAPTCHAs and search-engine blocking can reduce coverage.", "- Relevance/credibility scores are heuristics, not truth labels.", "- The crawler stores excerpts and cache entries locally; review sensitive research outputs before sharing.", "", "## Progress events", ""]
     for e in events[-80:]:
         lines.append(f"- `{time.strftime('%H:%M:%S', time.gmtime(e['ts']))}` {e['event']}: {e['detail']} ({e['done']}/{e['total']})")
@@ -575,6 +707,11 @@ def handler(args=None, **_kw):
     external_budget = _int(args.get("external_link_budget"), cfg["external_link_budget"], 0, 500) if int(args.get("external_link_budget") or -1) >= 0 else cfg["external_link_budget"]
     cache_ttl = _int(args.get("cache_ttl_seconds"), 86400, 0, 30 * 86400)
     force_refresh = _bool(args.get("force_refresh"), False)
+    respect_robots = _bool(args.get("respect_robots"), True)
+    try:
+        rate_limit_seconds = max(0.0, min(30.0, float(args.get("rate_limit_seconds", DEFAULT_RATE_LIMIT_SECONDS))))
+    except Exception:
+        rate_limit_seconds = DEFAULT_RATE_LIMIT_SECONDS
     follow_external = _bool(args.get("follow_external"), True)
     same_domain_only = _bool(args.get("same_domain_only"), False)
     formats = [x for x in _list(args.get("export_formats") or ["markdown", "html"]) if x in {"markdown", "html", "json"}] or ["markdown", "html"]
@@ -604,7 +741,8 @@ def handler(args=None, **_kw):
 
     queue: list[tuple[str, int, str]] = []
     for u in list(dict.fromkeys(seed_urls + discovered_by_search)):
-        queue.append((u, 0, _domain(u)))
+        cu = _canonical_url(u) or u
+        queue.append((cu, 0, _domain(cu)))
     visited: set[str] = set()
     seed_domains = {_domain(u) for u in seed_urls or discovered_by_search if _domain(u)}
     external_added = 0
@@ -615,12 +753,12 @@ def handler(args=None, **_kw):
         if url in visited or depth > max_depth:
             continue
         visited.add(url)
-        fetched = _fetch(url, timeout, cache_ttl, force_refresh, con)
+        fetched = _fetch(url, timeout, cache_ttl, force_refresh, con, respect_robots=respect_robots, rate_limit_seconds=rate_limit_seconds)
         title, text, links = _parse_page(url, fetched.get("body") or "", fetched.get("content_type") or "")
         summary = _summarize(text, query) if text else ""
-        relevance, credibility, word_count = _store_page(con, job_id, url, depth, fetched, title, text, summary, links, query)
+        relevance, credibility, word_count, duplicate = _store_page(con, job_id, url, depth, fetched, title, text, summary, links, query)
         pages_done += 1
-        _event(con, job_id, "fetch", f"{fetched.get('status')} rel={relevance:.2f} cred={credibility:.2f} words={word_count} {url} title={title[:120]}", pages_done, max_pages)
+        _event(con, job_id, "fetch", f"{fetched.get('status')} rel={relevance:.2f} cred={credibility:.2f} words={word_count} dup={int(duplicate)} cache={int(bool(fetched.get('cached')))} {url} title={title[:120]}", pages_done, max_pages)
 
         if depth < max_depth and pages_done < max_pages:
             current_domain = _domain(url)
@@ -628,6 +766,7 @@ def handler(args=None, **_kw):
             terms = _terms(query)
             links = sorted(links, key=lambda link: sum(1 for t in terms if t in link.lower()), reverse=True)
             for link in links:
+                link = _canonical_url(link) or link
                 if link in visited:
                     continue
                 link_domain = _domain(link)
@@ -640,12 +779,12 @@ def handler(args=None, **_kw):
                     external_added += 1
                 queue.append((link, depth + 1, origin_domain or current_domain))
 
-    status = "success" if pages_done else "partial"
+    status = "success" if pages_done >= max_pages else ("partial" if pages_done else "failed")
     con.execute("UPDATE jobs SET status=?, updated_at=?, progress=?, pages_done=?, pages_target=? WHERE job_id=?", (status, _now(), 1.0 if pages_done else 0.0, pages_done, max_pages, job_id))
     con.commit()
-    search_meta = {"engines": discovery_by_engine, "seed_urls": seed_urls, "external_added": external_added, "visited": len(visited)}
+    search_meta = {"engines": discovery_by_engine, "seed_urls": seed_urls, "external_added": external_added, "visited": len(visited), "cache_ttl_seconds": cache_ttl, "respect_robots": respect_robots, "rate_limit_seconds": rate_limit_seconds}
     paths = _export(con, job_id, formats, search_meta=search_meta)
-    pages = list(con.execute("SELECT p.url,p.title,p.status,p.depth,p.summary,p.text,p.relevance,p.word_count,s.credibility FROM pages p LEFT JOIN sources s ON p.source_id=s.source_id WHERE p.job_id=? ORDER BY p.relevance DESC, p.depth ASC, p.fetched_at ASC", (job_id,)))
+    pages = list(con.execute("SELECT p.url,p.title,p.status,p.depth,p.summary,p.text,p.relevance,p.credibility,p.word_count,p.canonical_url,p.content_hash,p.citations_json FROM pages p WHERE p.job_id=? ORDER BY p.relevance DESC, p.credibility DESC, p.depth ASC, p.fetched_at ASC", (job_id,)))
     events = list(con.execute("SELECT event,detail,done,total,ts FROM progress_events WHERE job_id=? ORDER BY id DESC LIMIT 20", (job_id,)))
     result = {
         "status": status,
@@ -663,12 +802,15 @@ def handler(args=None, **_kw):
         "discovered_by_search": discovered_by_search[:50],
         "discovery_by_engine": {k: v[:20] for k, v in discovery_by_engine.items()},
         "sources": [
-            {"url": p["url"], "title": p["title"], "status": p["status"], "depth": p["depth"], "relevance": p["relevance"], "credibility": p["credibility"], "word_count": p["word_count"], "summary": p["summary"], **({"text_excerpt": (p["text"] or "")[:2000]} if include_raw else {})}
+            {"url": p["url"], "canonical_url": p["canonical_url"], "title": p["title"], "status": p["status"], "depth": p["depth"], "relevance": p["relevance"], "credibility": p["credibility"], "word_count": p["word_count"], "summary": p["summary"], "citations": json.loads(p["citations_json"] or "[]"), **({"text_excerpt": (p["text"] or "")[:2000]} if include_raw else {})}
             for p in pages[:100]
         ],
         "recent_progress_events": [dict(e) for e in reversed(events)],
         "seconds": round(_now() - started, 2),
     }
+    if _bool(args.get("memory_wiki_task_capsule"), False):
+        job = con.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+        result["memory_wiki_task_capsule"] = _memory_capsule(job, pages, paths)
     return _json(result)
 
 

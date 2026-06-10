@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke tests for hermes-omnicouncil v4 omni-blackboard layer."""
+"""Smoke tests for hermes-omnicouncil v5.1.1 omni-blackboard layer."""
 from __future__ import annotations
 
 import importlib.util
@@ -11,10 +11,12 @@ spec = importlib.util.spec_from_file_location("hermes_omnicouncil_smoke", PLUGIN
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
-assert mod.VERSION == "4.0.0-omni-blackboard"
-assert mod.DEFAULT_MAX_TOKENS == 128000
-assert mod.DEFAULT_JUDGE_MAX_TOKENS == 128000
+assert mod.VERSION == "5.1.1-omni-blackboard-deepseek-default"
+assert mod.DEFAULT_MODEL == "deepseek-v4-pro"
+assert mod.DEFAULT_MAX_TOKENS == 384000
+assert mod.DEFAULT_JUDGE_MAX_TOKENS == 384000
 assert mod.MAX_CONTEXT_CHARS == 1_000_000
+assert mod.MAX_BROKERED_TOOL_REQUESTS == mod.MAX_AGENTIC_TOOL_REQUESTS * 2
 assert "omni_blackboard" in mod.CONSILIUM_PRESETS
 assert mod.SAFE_AGENT_TOOLS
 assert "web_search" in mod.SAFE_AGENT_TOOLS
@@ -27,6 +29,9 @@ assert "deepseek" in mod.MODEL_PRESETS
 assert "gpt55" in mod.MODEL_PRESETS
 assert "mixed" in mod.MODEL_PRESETS
 
+# v5 new presets
+assert "ultra" in mod.CONSILIUM_PRESETS
+
 # preset defaults
 scaled = mod._apply_preset_defaults({"preset": "omni_blackboard", "task": "test", "context": ""})
 assert scaled["agentic_blackboard"] is True
@@ -35,6 +40,14 @@ assert scaled["capability_profile"] == "omni"
 assert scaled["message_rounds"] == 2
 
 # model resolution
+default0, members0, judge0, research0 = mod._resolve_models({})
+assert default0 == "deepseek-v4-pro"
+assert members0 == ["deepseek-v4-pro"]
+assert judge0 == "deepseek-v4-pro"
+assert research0 == "deepseek-v4-pro"
+assert mod.SCHEMA["parameters"]["properties"]["model"]["default"] == "deepseek-v4-pro"
+assert mod.SCHEMA["parameters"]["properties"]["model_preset"]["default"] == "deepseek"
+
 default, members, judge, research = mod._resolve_models({"model_preset": "mixed"})
 assert default == "deepseek-v4-pro" or default
 assert len(members) == 4
@@ -49,6 +62,7 @@ for key in [
     "agentic_blackboard", "minimum_tools", "brokered_tools",
     "return_blackboard", "return_evidence", "output_format", "save_task_capsule",
     "decision_policy", "red_team", "auto_scale", "request_jitter_ms",
+    "dissent_required", "anti_slop", "self_review_round",
 ]:
     assert key in mod.SCHEMA["parameters"]["properties"], key
 
@@ -58,6 +72,14 @@ reqs = mod._extract_tool_requests(
     10,
 )
 assert len(reqs) == 1 and reqs[0]["tool"] == "web_search"
+assert "expected_information_gain" in reqs[0]
+assert reqs[0]["mutating"] is False
+
+mutating_reqs = mod._extract_tool_requests('TOOL_REQUESTS_JSON: [{"tool":"web_search","mutating":true,"args":{"query":"x"}}]', 10)
+assert mutating_reqs == []
+
+weak = mod._dedupe_tool_requests([{"label":"C1M1", "tool_requests":[{"tool":"web_search","args":{"query":"x"},"priority":1}]}], 10, minimum_tools=True)
+assert weak and weak[0].get("weak_request") is True
 
 # message extraction
 msgs = mod._extract_messages('Messages: [{"to":"C2M1","type":"question","content":"What about X?"}]')
@@ -123,7 +145,28 @@ try:
     assert data["tool"] == "hermes_omnicouncil"
     assert data.get("messages_exchanged", -1) >= 0
     assert data.get("message_rounds") == 1
+    assert "tool_requests_executed" in data.get("diagnostics", {})
+    assert data.get("dissent_required") is False
     assert "hermes-omnicouncil" in mod.CACHE_DIR.as_posix()
+
+    raw_off = mod.handler({
+        "task": "tool mode off test",
+        "context": "",
+        "preset": "omni_blackboard",
+        "councils": 1,
+        "members_per_council": 1,
+        "collaborate": False,
+        "message_rounds": 0,
+        "research_missions": False,
+        "auto_memory_context": False,
+        "use_cache": False,
+        "return_evidence": False,
+        "tool_mode": "off",
+        "request_jitter_ms": 0,
+    })
+    data_off = json.loads(raw_off)
+    assert data_off["tool_mode"] == "off"
+    assert data_off["tool_requests"] == []
 
     # presets without blackboard
     raw2 = mod.handler({
@@ -148,4 +191,4 @@ finally:
     mod.call_model = old_call
     mod.CACHE_DIR = old_cache
 
-print(f"hermes-omnicouncil v4 smoke ok: tools={len(registered)} calls={len(calls)} member_models={data.get('member_model_count')} messages_rounds={data.get('message_rounds')}")
+print(f"hermes-omnicouncil v5.1.1 smoke ok: tools={len(registered)} calls={len(calls)} member_models={data.get('member_model_count')} messages_rounds={data.get('message_rounds')}")

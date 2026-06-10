@@ -1,11 +1,11 @@
-"""hermes-omnicouncil v4.0 — multi-model agentic council with blackboard + message rounds.
+"""hermes-omnicouncil v5.1.1 — multi-model agentic council with blackboard + message rounds.
 
 Features:
 - Swappable models (model/member_models/judge_model/model_preset)
 - Shared blackboard with message rounds for inter-agent communication
 - Safe agent tools: memory (query/pack), file read/search, web_search, web_extract, web_research_brief
 - NO patch/write significant tools for agents (read-only safety)
-- Presets (fast/balanced/deep/audit/max/omni_blackboard)
+- Presets (fast/balanced/deep/audit/max/omni_blackboard/ultra)
 - Evidence ledger, tool-request protocol, collaboration rounds, judge synthesis
 - deep_web_crawl for professional research reports
 """
@@ -23,13 +23,69 @@ import time
 from pathlib import Path
 from typing import Any
 
-_spec = _iu.spec_from_file_location(
-    "evey_utils",
-    _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "evey_utils.py"),
-)
-_eu = _iu.module_from_spec(_spec)
-_spec.loader.exec_module(_eu)
-call_model = _eu.call_model
+_EVEY_UTILS_PATH = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "evey_utils.py")
+
+if _os.path.exists(_EVEY_UTILS_PATH):
+    _spec = _iu.spec_from_file_location("evey_utils", _EVEY_UTILS_PATH)
+    _eu = _iu.module_from_spec(_spec)
+    _spec.loader.exec_module(_eu)
+    call_model = _eu.call_model
+else:
+    def call_model(
+        model: str,
+        prompt: str,
+        max_tokens: int = 128000,
+        temperature: float = 0.7,
+        retries: int = 2,
+        timeout: int = 60,
+        reasoning_effort: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Small standalone fallback for smoke tests outside a Hermes plugin tree."""
+        import urllib.error
+        import urllib.request
+
+        base_url = (
+            _os.environ.get("EVEY_LITELLM_URL")
+            or _os.environ.get("HERMES_DELEGATE_BASE_URL")
+            or _os.environ.get("CODEX_BASE_URL")
+            or "http://127.0.0.1:18089/v1"
+        ).rstrip("/")
+        api_key = (
+            _os.environ.get("EVEY_LITELLM_KEY")
+            or _os.environ.get("HERMES_DELEGATE_API_KEY")
+            or _os.environ.get("CODEX_API_KEY")
+            or "noop"
+        )
+        payload = {
+            "model": model or "deepseek-v4-pro",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
+        data = json.dumps(payload).encode("utf-8")
+        last_error: Exception | None = None
+        for attempt in range(max(1, retries + 1)):
+            try:
+                req = urllib.request.Request(
+                    f"{base_url}/chat/completions",
+                    data=data,
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+                )
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    result = json.loads(resp.read().decode("utf-8"))
+                choices = result.get("choices") or []
+                msg = (choices[0].get("message") if choices else {}) or {}
+                content = msg.get("content") or msg.get("reasoning_content") or ""
+                if content:
+                    return {"content": str(content).strip(), "model": model, "tokens": (result.get("usage") or {}).get("total_tokens", 0)}
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+                last_error = exc
+                if attempt + 1 < max(1, retries + 1):
+                    time.sleep(min(2 ** attempt, 8))
+        logger.warning("standalone call_model(%s) failed: %s", model, last_error)
+        return None
 
 logger = logging.getLogger("hermes.omnicouncil")
 _RUNTIME_CTX: Any = None
@@ -46,8 +102,8 @@ _deep_spec.loader.exec_module(_deep_web_research)
 #  Configurable model defaults
 # ═══════════════════════════════════════════════════════════════════════
 DEFAULT_MODEL = "deepseek-v4-pro"
-REASONING_EFFORT = "xhigh"
-VERSION = "4.0.0-omni-blackboard"
+REASONING_EFFORT = "high"
+VERSION = "5.1.1-omni-blackboard-deepseek-default"
 
 MODEL_PRESETS = {
     "deepseek": {
@@ -74,8 +130,8 @@ DEFAULT_COUNCILS = 5
 DEFAULT_MEMBERS_PER_COUNCIL = 4
 MAX_COUNCILS = 8
 MAX_MEMBERS_PER_COUNCIL = 8
-DEFAULT_MAX_TOKENS = 128000
-DEFAULT_JUDGE_MAX_TOKENS = 128000
+DEFAULT_MAX_TOKENS = 384000
+DEFAULT_JUDGE_MAX_TOKENS = 384000
 DEFAULT_COLLABORATION_ROUNDS = 2
 DEFAULT_MESSAGE_ROUNDS = 1
 DEFAULT_MEMBER_RETRIES = 1
@@ -99,6 +155,7 @@ MAX_MESSAGE_CHARS = 4_000
 MAX_MESSAGE_HISTORY_CHARS = 16_000
 MAX_TOOL_REQUESTS_DEFAULT = 20
 MAX_AGENTIC_TOOL_REQUESTS = 200
+MAX_BROKERED_TOOL_REQUESTS = MAX_AGENTIC_TOOL_REQUESTS * 2
 AGENTIC_ACTIVE_TOOL_AGENTS = 4
 AGENTIC_MUTATING_AGENTS = 0
 DEFAULT_MEMORY_CONTEXT_CHARS = 12_000
@@ -120,6 +177,7 @@ SAFE_AGENT_TOOLS = [
     "search_files",
     "web_search",
     "web_extract",
+    "web_research_brief",
     "skill_view",
     "skills_list",
 ]
@@ -187,6 +245,28 @@ CONSILIUM_PRESETS = {
         "active_tool_agents": AGENTIC_ACTIVE_TOOL_AGENTS,
         "mutating_agents": AGENTIC_MUTATING_AGENTS,
     },
+    "ultra": {
+        "councils": MAX_COUNCILS,
+        "members_per_council": MAX_MEMBERS_PER_COUNCIL,
+        "collaboration_rounds": 6,
+        "message_rounds": 3,
+        "research_missions": True,
+        "red_team": True,
+        "tool_mode": "safe_agent",
+        "capability_profile": "omni",
+        "max_research_agents": AGENTIC_ACTIVE_TOOL_AGENTS,
+        "max_member_workers": DEFAULT_MAX_MEMBER_WORKERS,
+        "max_research_workers": DEFAULT_MAX_RESEARCH_WORKERS,
+        "max_collaboration_workers": DEFAULT_MAX_COLLABORATION_WORKERS,
+        "max_tool_requests": MAX_AGENTIC_TOOL_REQUESTS * 2,
+        "agentic_blackboard": True,
+        "minimum_tools": True,
+        "brokered_tools": True,
+        "active_tool_agents": AGENTIC_ACTIVE_TOOL_AGENTS,
+        "mutating_agents": AGENTIC_MUTATING_AGENTS,
+        "max_tokens": 384000,
+        "judge_max_tokens": 384000,
+    },
 }
 
 CAPABILITY_PROFILES = {
@@ -208,7 +288,7 @@ STATIC_TOOLSETS = {
 SCHEMA = {
     "name": "hermes_omnicouncil",
     "description": (
-        "Hermes OmniCouncil v4: multi-model agentic council with shared blackboard, message rounds, "
+        "Hermes OmniCouncil v5.1.1: multi-model agentic council with shared blackboard, message rounds, "
         "safe memory/web/file tools, swappable models, web_research_brief, and deep_web_crawl. "
         "Agents collaborate via blackboard notes, peer review, and directed messages. "
         "judge synthesises the final result."
@@ -220,8 +300,8 @@ SCHEMA = {
             "context": {"type": "string", "description": "Дополнительный контекст."},
             "mode": {"type": "string", "enum": ["advise", "edit_plan", "review", "debug"], "default": "edit_plan"},
             "preset": {"type": "string", "enum": list(CONSILIUM_PRESETS), "default": "deep"},
-            "model": {"type": "string", "default": "", "description": "Модель по умолчанию для всех агентов (переопределяет model_preset)."},
-            "model_preset": {"type": "string", "enum": list(MODEL_PRESETS), "default": "", "description": "Пресет моделей: deepseek/gpt55/mixed."},
+            "model": {"type": "string", "default": DEFAULT_MODEL, "description": "Модель по умолчанию для всех агентов (переопределяет model_preset)."},
+            "model_preset": {"type": "string", "enum": list(MODEL_PRESETS), "default": "deepseek", "description": "Пресет моделей: deepseek/gpt55/mixed. Default: deepseek for local DeepSeek proxy compatibility."},
             "member_models": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Модели участников."},
             "judge_model": {"type": "string", "default": "", "description": "Модель для judge."},
             "research_model": {"type": "string", "default": "", "description": "Модель для research missions."},
@@ -274,6 +354,9 @@ SCHEMA = {
             "judge_timeout": {"type": "integer", "default": DEFAULT_JUDGE_TIMEOUT},
             "request_jitter_ms": {"type": "integer", "default": DEFAULT_REQUEST_JITTER_MS},
             "strict_json": {"type": "boolean", "default": False},
+            "dissent_required": {"type": "boolean", "default": False, "description": "Судья обязан перечислить dissent/objections даже при консенсусе."},
+            "anti_slop": {"type": "boolean", "default": False, "description": "Каждая рекомендация должна иметь file:line/concrete detail."},
+            "self_review_round": {"type": "boolean", "default": False, "description": "Post-judge self-review round для проверки unsupported claims."},
         },
         "required": ["task"],
     },
@@ -461,8 +544,14 @@ def _is_retryable_error_text(exc: Exception) -> bool:
 #  Safe tool execution (read-only)
 # ═══════════════════════════════════════════════════════════════
 def _execute_safe_tool(tool_name: str, tool_args: dict[str, Any]) -> dict[str, Any]:
+    tool_name = str(tool_name or "").strip()
+    if tool_name not in SAFE_AGENT_TOOLS:
+        return {"ok": False, "error": "tool_not_allowed", "tool": tool_name}
+    if not isinstance(tool_args, dict):
+        tool_args = {}
     ctx = _RUNTIME_CTX
     if ctx is not None:
+        # ── Способ 1: call_tool / invoke_tool / run_tool / execute_tool ──
         for method_name in ("call_tool", "invoke_tool", "run_tool", "execute_tool"):
             method = getattr(ctx, method_name, None)
             if not callable(method):
@@ -484,7 +573,103 @@ def _execute_safe_tool(tool_name: str, tool_args: dict[str, Any]) -> dict[str, A
                     continue
             except Exception:
                 continue
-    return {"ok": False, "error": "tool_invoker_unavailable"}
+        # ── Способ 2: прямой вызов tool-функции из tool_registry/plugins ──
+        for registry_attr in ("tools", "tool_registry", "_tools", "_tool_registry", "registered_tools"):
+            registry = getattr(ctx, registry_attr, None)
+            if not isinstance(registry, dict):
+                continue
+            tool_entry = registry.get(tool_name)
+            if tool_entry is None:
+                continue
+            handler = None
+            if callable(tool_entry):
+                handler = tool_entry
+            elif isinstance(tool_entry, dict):
+                handler = tool_entry.get("handler") or tool_entry.get("fn") or tool_entry.get("callable")
+            if not callable(handler):
+                continue
+            try:
+                result = handler(tool_args)
+                return _redact(str(result)) if not isinstance(result, dict) else result
+            except TypeError:
+                try:
+                    result = handler(**tool_args)
+                    return _redact(str(result)) if not isinstance(result, dict) else result
+                except Exception:
+                    continue
+            except Exception:
+                continue
+        # ── Способ 3: getattr(ctx, tool_name) ──
+        direct = getattr(ctx, tool_name, None)
+        if callable(direct):
+            try:
+                result = direct(tool_args)
+                return _redact(str(result)) if not isinstance(result, dict) else result
+            except TypeError:
+                try:
+                    result = direct(**tool_args)
+                    return _redact(str(result)) if not isinstance(result, dict) else result
+                except Exception:
+                    pass
+            except Exception:
+                pass
+    return {"ok": False, "error": "tool_invoker_unavailable", "tool": tool_name}
+
+
+def _tool_result_preview(result: Any, max_chars: int = 6000) -> dict[str, Any]:
+    """Return a bounded/redacted result object suitable for agent prompts."""
+    if isinstance(result, dict):
+        text = _redact(_json(result))
+        try:
+            parsed = _safe_json_loads(text)
+            if isinstance(parsed, dict):
+                return parsed if len(text) <= max_chars else {"ok": parsed.get("ok", True), "preview": _truncate_text(text, max_chars)}
+        except Exception:
+            pass
+        return {"ok": True, "preview": _truncate_text(text, max_chars)}
+    return {"ok": True, "preview": _truncate_text(_redact(str(result)), max_chars)}
+
+
+def _execute_tool_requests(tool_requests: list[dict[str, Any]], ledger: list[dict[str, Any]], max_workers: int = 4) -> list[dict[str, Any]]:
+    """Broker safe read-only tool requests and attach bounded results in-place.
+
+    Agents can only request tools; this orchestrator executes whitelisted read-only
+    tools and exposes redacted previews to later collaboration rounds and judge.
+    """
+    if not tool_requests:
+        return tool_requests
+    pending = [req for req in tool_requests if isinstance(req, dict) and req.get("tool") and "result" not in req]
+    if not pending:
+        return tool_requests
+
+    def run(req: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        tool = str(req.get("tool") or "").strip()
+        args = req.get("args", {}) if isinstance(req.get("args", {}), dict) else {}
+        started = time.time()
+        try:
+            result = _execute_safe_tool(tool, args)
+            preview = _tool_result_preview(result)
+            preview["elapsed_ms"] = int((time.time() - started) * 1000)
+            return req, preview
+        except Exception as exc:
+            return req, {"ok": False, "error": _truncate_text(str(exc), 800), "elapsed_ms": int((time.time() - started) * 1000)}
+
+    worker_count = max(1, min(len(pending), max_workers or 4))
+    completed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
+        future_map = {pool.submit(run, req): req for req in pending}
+        for future in concurrent.futures.as_completed(future_map):
+            req = future_map[future]
+            try:
+                _, result = future.result()
+            except Exception as exc:
+                result = {"ok": False, "error": _truncate_text(str(exc), 800)}
+            req["result"] = result
+            req["executed"] = True
+            completed += 1
+    if completed:
+        _add_evidence(ledger, "tool_execution", f"Executed {completed} brokered safe tool requests.", count=completed)
+    return tool_requests
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -628,7 +813,7 @@ def _build_capability_manifest(args: dict[str, Any], ledger: list[dict[str, Any]
     }
     if agentic_blackboard or preset_active(args):
         manifest["blackboard"] = _build_blackboard_policy(
-            max_tool_requests=_clamp_int(args.get("max_tool_requests"), MAX_AGENTIC_TOOL_REQUESTS, 0, MAX_AGENTIC_TOOL_REQUESTS),
+            max_tool_requests=_clamp_int(args.get("max_tool_requests"), MAX_AGENTIC_TOOL_REQUESTS, 0, MAX_BROKERED_TOOL_REQUESTS),
             active_tool_agents=_clamp_int(args.get("active_tool_agents"), AGENTIC_ACTIVE_TOOL_AGENTS, 1, 20),
             mutating_agents=_clamp_int(args.get("mutating_agents"), AGENTIC_MUTATING_AGENTS, 0, 0),
             minimum_tools=minimum_tools,
@@ -820,7 +1005,7 @@ Tool request protocol:
 - Ты не вызываешь tools напрямую, но можешь запросить их выполнение.
 """
 
-    return f"""Ты участник {council_i + 1}/{councils} OmniCouncil (Hermes OmniCouncil v4).
+    return f"""Ты участник {council_i + 1}/{councils} OmniCouncil (Hermes OmniCouncil v5.1).
 Модель: {member_model}
 Перспектива: {perspective}
 Режим: {mode}
@@ -890,7 +1075,7 @@ def _safe_json_loads(text: str) -> Any:
 def _extract_tool_requests(text: str, max_items: int) -> list[dict[str, Any]]:
     if not text or max_items <= 0:
         return []
-    limit = min(max_items, MAX_AGENTIC_TOOL_REQUESTS)
+    limit = min(max_items, MAX_BROKERED_TOOL_REQUESTS)
     candidates = []
     balanced = _json_array_after_marker(text)
     if balanced:
@@ -910,14 +1095,18 @@ def _extract_tool_requests(text: str, max_items: int) -> list[dict[str, Any]]:
                         tool = _truncate_text(item.get("tool", ""), 120).strip()
                         if not tool:
                             continue
-                        # Block unsafe tools
-                        if tool in ("patch", "write_file", "terminal", "process", "cronjob"):
+                        # Block unsafe/mutating tools. OmniCouncil broker is read-only by design.
+                        mutating = _normalise_bool(item.get("mutating"), False)
+                        if tool in ("patch", "write_file", "terminal", "process", "cronjob") or mutating:
                             continue
                         cleaned.append({
                             "tool": tool,
                             "args": item.get("args", {}) if isinstance(item.get("args", {}), dict) else {},
                             "reason": _truncate_text(item.get("reason", ""), 500),
                             "priority": _clamp_int(item.get("priority"), 3, 1, 5),
+                            "expected_information_gain": _truncate_text(item.get("expected_information_gain", ""), 500),
+                            "mutating": False,
+                            "requires_lock": _as_str_list(item.get("requires_lock")),
                         })
                 return cleaned[:limit]
         except Exception:
@@ -955,7 +1144,7 @@ def _extract_messages(text: str) -> list[dict[str, Any]]:
 def _dedupe_tool_requests(answers: list[dict[str, Any]], max_items: int, minimum_tools: bool = True) -> list[dict[str, Any]]:
     if max_items <= 0:
         return []
-    limit = min(max_items, MAX_AGENTIC_TOOL_REQUESTS)
+    limit = min(max_items, MAX_BROKERED_TOOL_REQUESTS)
     seen = set()
     out = []
     for ans in answers:
@@ -965,6 +1154,8 @@ def _dedupe_tool_requests(answers: list[dict[str, Any]], max_items: int, minimum
                 continue
             seen.add(key)
             req = dict(req)
+            if minimum_tools and not (req.get("reason") or req.get("expected_information_gain")):
+                req["weak_request"] = True
             req["requested_by"] = ans.get("label")
             out.append(req)
     out.sort(key=lambda x: int(x.get("priority") or 3), reverse=True)
@@ -1292,6 +1483,8 @@ def _judge_prompt(
     output_format: str, save_task_capsule: bool,
     decision_policy: str = "judge", red_team: bool = False,
     judge_model: str = DEFAULT_MODEL,
+    dissent_required: bool = False,
+    anti_slop: bool = False,
 ) -> str:
     blackboard_enabled = bool((manifest.get("blackboard") or {}).get("enabled"))
     discussion = "\n\n".join(
@@ -1317,13 +1510,30 @@ def _judge_prompt(
         "json": "Верни валидный JSON: summary, evidence, decision, implementation_plan[], tests[], risks[], next_step.",
     }.get(output_format, "Верни структурированный отчёт.")
 
-    prompt = f"""Ты финальный судья Hermes OmniCouncil v4 (модель: {judge_model}).
+    # ── Conditional blocks (f-string-safe, без бэкслешей) ──
+    dissent_block = (
+        "DISSENT_REQUIRED: Ты ОБЯЗАН включить секцию Dissent / Objections. "
+        'Даже если все агенты согласны — найди минимум 3 правдоподобных failure mode, '
+        'скрытых допущения или альтернативных интерпретации. '
+        'Включи подсекцию "What would change my mind".'
+        if dissent_required else ""
+    )
+    anti_slop_block = (
+        "ANTI_SLOP: Каждая рекомендация должна включать: конкретный file:line (если применимо), "
+        "expected benefit, possible downside, verification method. "
+        'Избегай общих фраз вроде "ensure security" или "add tests" без конкретики.'
+        if anti_slop else ""
+    )
+
+    prompt = f"""Ты финальный судья Hermes OmniCouncil v5.1 (модель: {judge_model}).
 Синтезируй лучший проверяемый результат, опираясь на evidence и research.
 
 Output format: {output_format}
 {format_rules}
 Decision policy: {decision_policy}
 {decision_rule}
+{dissent_block}
+{anti_slop_block}
 
 Задача:
 {task}
@@ -1369,8 +1579,10 @@ def _judge(
     strict_json: bool = False, decision_policy: str = "judge", red_team: bool = False,
     jitter_ms: int = DEFAULT_REQUEST_JITTER_MS,
     judge_model: str = DEFAULT_MODEL,
+    dissent_required: bool = False,
+    anti_slop: bool = False,
 ) -> str:
-    prompt = _judge_prompt(task, context, mode, answers, transcript, manifest, ledger, research_reports, tool_requests, messages, output_format, save_task_capsule, decision_policy, red_team, judge_model=judge_model)
+    prompt = _judge_prompt(task, context, mode, answers, transcript, manifest, ledger, research_reports, tool_requests, messages, output_format, save_task_capsule, decision_policy, red_team, judge_model=judge_model, dissent_required=dissent_required, anti_slop=anti_slop)
     if strict_json and output_format == "json":
         prompt += "\n\nSTRICT_JSON: Return only valid JSON, no markdown fences."
     try:
@@ -1407,7 +1619,7 @@ def _make_research_missions(task: str, mode: str, manifest: dict[str, Any], max_
 
 def _run_research_mission(mission: dict[str, Any], manifest: dict[str, Any], max_tokens: int, jitter_ms: int = DEFAULT_REQUEST_JITTER_MS, research_model: str = DEFAULT_MODEL) -> dict[str, Any]:
     try:
-        prompt = f"""Ты research subagent в Hermes OmniCouncil v4.
+        prompt = f"""Ты research subagent в Hermes OmniCouncil v5.1.
 Используй safe tools (web_search, web_extract, read_file, memory_wiki_query) для поиска фактов.
 Отделяй Evidence от Assumption. Верни Findings, Risks, Acceptance tests.
 
@@ -1571,8 +1783,8 @@ def handler(args=None, **_kw):
     if decision_policy not in {"judge", "majority", "consensus", "risk_weighted"}:
         decision_policy = "judge"
     red_team = _normalise_bool(args.get("red_team"), False)
-    max_tokens = _clamp_int(args.get("max_tokens"), DEFAULT_MAX_TOKENS, 1000, 128000)
-    judge_max_tokens = _clamp_int(args.get("judge_max_tokens"), DEFAULT_JUDGE_MAX_TOKENS, 1000, 128000)
+    max_tokens = _clamp_int(args.get("max_tokens"), DEFAULT_MAX_TOKENS, 1000, 384000)
+    judge_max_tokens = _clamp_int(args.get("judge_max_tokens"), DEFAULT_JUDGE_MAX_TOKENS, 1000, 384000)
     use_cache = _normalise_bool(args.get("use_cache"), True) and not _normalise_bool(args.get("force_refresh"), False)
     cache_ttl_seconds = _clamp_int(args.get("cache_ttl_seconds"), CACHE_TTL, 0, 30 * 24 * 60 * 60)
     collaborate = _normalise_bool(args.get("collaborate"), True)
@@ -1582,8 +1794,13 @@ def handler(args=None, **_kw):
     return_evidence = _normalise_bool(args.get("return_evidence"), True)
     research_missions = _normalise_bool(args.get("research_missions"), False)
     max_research_agents = _clamp_int(args.get("max_research_agents"), 3, 0, 8)
-    max_tool_requests = _clamp_int(args.get("max_tool_requests"), MAX_TOOL_REQUESTS_DEFAULT, 0, MAX_AGENTIC_TOOL_REQUESTS)
-    tool_mode = args.get("tool_mode", "safe_agent") or "safe_agent"
+    max_tool_requests = _clamp_int(args.get("max_tool_requests"), MAX_TOOL_REQUESTS_DEFAULT, 0, MAX_BROKERED_TOOL_REQUESTS)
+    tool_mode = str(args.get("tool_mode", "safe_agent") or "safe_agent").strip().lower()
+    if tool_mode not in {"off", "safe_agent"}:
+        tool_mode = "safe_agent"
+    if tool_mode == "off":
+        max_tool_requests = 0
+        brokered_tools = False
     output_format = args.get("output_format", "structured") or "structured"
     if output_format not in {"prose", "structured", "patch_plan", "json"}:
         output_format = "structured"
@@ -1595,6 +1812,9 @@ def handler(args=None, **_kw):
     judge_timeout = _clamp_int(args.get("judge_timeout"), DEFAULT_JUDGE_TIMEOUT, 30, 3600)
     request_jitter_ms = _clamp_int(args.get("request_jitter_ms"), DEFAULT_REQUEST_JITTER_MS, 0, MAX_REQUEST_JITTER_MS)
     strict_json = _normalise_bool(args.get("strict_json"), False)
+    dissent_required = _normalise_bool(args.get("dissent_required"), False)
+    anti_slop = _normalise_bool(args.get("anti_slop"), False)
+    self_review_round = _normalise_bool(args.get("self_review_round"), False)
     enabled_toolsets = _as_str_list(args.get("enabled_toolsets"))
     total_members = councils * members_per_council
     max_member_workers = _clamp_int(args.get("max_member_workers"), DEFAULT_MAX_MEMBER_WORKERS, 1, MAX_COUNCILS * MAX_MEMBERS_PER_COUNCIL)
@@ -1621,6 +1841,7 @@ def handler(args=None, **_kw):
         "preset": args.get("preset"), "councils": councils, "members_per_council": members_per_council,
         "decision_policy": decision_policy, "red_team": red_team, "agentic_blackboard": agentic_blackboard,
         "tool_mode": tool_mode, "capability_profile": manifest.get("capability_profile"),
+        "dissent_required": dissent_required, "anti_slop": anti_slop, "self_review_round": self_review_round,
     }, manifest, default_model)
     cache_file = CACHE_DIR / f"{key}.json"
     if use_cache and cache_file.exists() and time.time() - cache_file.stat().st_mtime < cache_ttl_seconds:
@@ -1664,6 +1885,7 @@ def handler(args=None, **_kw):
     tool_requests = _dedupe_tool_requests(answers, max_tool_requests, minimum_tools=minimum_tools)
     if tool_requests:
         _add_evidence(ledger, "tool_requests", f"Collected {len(tool_requests)} unique tool requests from members.", count=len(tool_requests))
+        _execute_tool_requests(tool_requests, ledger, max_workers=max_research_workers)
 
     if succeeded < min_successful_members:
         transcript = []
@@ -1680,14 +1902,38 @@ def handler(args=None, **_kw):
         # ── Message rounds (агенты общаются друг с другом)
         message_transcript, all_messages = _run_message_rounds(task, context, mode, answers, message_rounds, max_tokens, manifest, ledger, tool_requests, max_tool_requests, max_collaboration_workers, model_timeout, member_retries, request_jitter_ms, blackboard=blackboard, member_models=member_models)
 
-        all_responses = answers + [r for t in transcript for r in t.get("responses", [])]
+        all_responses = answers + [r for t in transcript for r in t.get("responses", [])] + [r for t in message_transcript for r in t.get("responses", [])]
         tool_requests = _dedupe_tool_requests(all_responses, max_tool_requests, minimum_tools=minimum_tools)
+        if tool_requests:
+            _execute_tool_requests(tool_requests, ledger, max_workers=max_research_workers)
         collaboration_responded = sum(1 for round_item in transcript for response in round_item.get("responses", []) if response.get("status") == "success")
 
         try:
-            synthesis = _judge(task, context, mode, answers, judge_max_tokens, transcript, manifest, ledger, research_reports, tool_requests, all_messages, output_format, save_task_capsule, timeout=judge_timeout, retries=member_retries, strict_json=strict_json, decision_policy=decision_policy, red_team=red_team, jitter_ms=request_jitter_ms, judge_model=judge_model)
+            synthesis = _judge(task, context, mode, answers, judge_max_tokens, transcript, manifest, ledger, research_reports, tool_requests, all_messages, output_format, save_task_capsule, timeout=judge_timeout, retries=member_retries, strict_json=strict_json, decision_policy=decision_policy, red_team=red_team, jitter_ms=request_jitter_ms, judge_model=judge_model, dissent_required=dissent_required, anti_slop=anti_slop)
             status = "success"
             judge_error = ""
+
+            # ── Self-review round (опциональный post-judge check)
+            if self_review_round:
+                try:
+                    review_prompt = f"""Ты — self-review auditor для OmniCouncil judge synthesis.
+Проверь финальный ответ на:
+- unsupported claims (утверждения без evidence)
+- missing evidence (голословные рекомендации)
+- vague recommendations (без конкретных file:line/шагов)
+- unsafe suggestions (рискованные действия без rollback)
+- contradictions between agents (противоречия не разрешённые judge)
+- omitted high-risk dissent (скрытые риски, которые проигнорированы)
+
+Исходный ответ judge:
+{synthesis[:80000]}
+
+Верни ИСПРАВЛЕННУЮ версию ответа. Если всё ок — верни оригинал с пометкой [SELF-REVIEW: PASSED]."""
+                    reviewed = _call_model_text(review_prompt, min(judge_max_tokens, 64000), 0.05, model=judge_model, timeout=judge_timeout, jitter_ms=request_jitter_ms)
+                    if reviewed and len(reviewed) > 20 and "[SELF-REVIEW: PASSED]" not in reviewed:
+                        synthesis = reviewed
+                except Exception:
+                    pass
         except Exception as exc:
             judge_error = _truncate_text(str(exc), 1000)
             synthesis = _fallback_synthesis(task, mode, answers, transcript, research_reports, tool_requests, f"judge failed: {judge_error}")
@@ -1702,6 +1948,7 @@ def handler(args=None, **_kw):
         "messages_exchanged": len(all_messages),
         "research_success": sum(1 for r in research_reports if r.get("status") == "success"),
         "tool_requests": len(tool_requests),
+        "tool_requests_executed": sum(1 for req in tool_requests if req.get("executed")),
         "judge_success": not bool(judge_error),
         "bounded_workers": {"primary": primary_workers, "collaboration": max_collaboration_workers, "research": max_research_workers},
         "agentic_blackboard": agentic_blackboard,
@@ -1735,6 +1982,9 @@ def handler(args=None, **_kw):
         "capability_profile": manifest.get("capability_profile"),
         "research_missions": research_missions,
         "output_format": output_format,
+        "dissent_required": dissent_required,
+        "anti_slop": anti_slop,
+        "self_review_round": self_review_round,
         "seconds": round(time.time() - started, 1),
         "synthesis": synthesis,
         "tool_requests": tool_requests,
