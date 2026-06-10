@@ -1,0 +1,9 @@
+name: hermes-omnicouncil
+version: 4.0.0
+description: "Hermes OmniCouncil v4 — multi-model agentic council with shared blackboard, message rounds, safe memory/web/file tools, swappable models, web_research_brief, and deep_web_crawl for professional research reports."
+tools:
+  - hermes_omnicouncil
+  - deep_web_crawl
+provides_tools:
+  - hermes_omnicouncil
+  - deep_web_crawl
