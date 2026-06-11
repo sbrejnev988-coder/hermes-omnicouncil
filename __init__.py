@@ -1,4 +1,4 @@
-"""hermes-omnicouncil v5.1.1 — multi-model agentic council with blackboard + message rounds.
+"""hermes-omnicouncil v5.2.0 — multi-model agentic council with blackboard + message rounds.
 
 Features:
 - Swappable models (model/member_models/judge_model/model_preset)
@@ -11,8 +11,10 @@ Features:
 """
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import hashlib
+import inspect
 import importlib.util as _iu
 import json
 import logging
@@ -89,6 +91,7 @@ else:
 
 logger = logging.getLogger("hermes.omnicouncil")
 _RUNTIME_CTX: Any = None
+_ACTIVE_FALLBACK_MODELS: list[str] = []
 
 # ── deep_web_research (copied/imported companion tool) ──────────────────
 _deep_spec = _iu.spec_from_file_location(
@@ -103,7 +106,7 @@ _deep_spec.loader.exec_module(_deep_web_research)
 # ═══════════════════════════════════════════════════════════════════════
 DEFAULT_MODEL = "deepseek-v4-pro"
 REASONING_EFFORT = "high"
-VERSION = "5.1.1-omni-blackboard-deepseek-default"
+VERSION = "5.2.0-agentic-tools-deepseek-default"
 
 MODEL_PRESETS = {
     "deepseek": {
@@ -288,7 +291,7 @@ STATIC_TOOLSETS = {
 SCHEMA = {
     "name": "hermes_omnicouncil",
     "description": (
-        "Hermes OmniCouncil v5.1.1: multi-model agentic council with shared blackboard, message rounds, "
+        "Hermes OmniCouncil v5.2.0: multi-model agentic council with shared blackboard, message rounds, "
         "safe memory/web/file tools, swappable models, web_research_brief, and deep_web_crawl. "
         "Agents collaborate via blackboard notes, peer review, and directed messages. "
         "judge synthesises the final result."
@@ -302,6 +305,7 @@ SCHEMA = {
             "preset": {"type": "string", "enum": list(CONSILIUM_PRESETS), "default": "deep"},
             "model": {"type": "string", "default": DEFAULT_MODEL, "description": "Модель по умолчанию для всех агентов (переопределяет model_preset)."},
             "model_preset": {"type": "string", "enum": list(MODEL_PRESETS), "default": "deepseek", "description": "Пресет моделей: deepseek/gpt55/mixed. Default: deepseek for local DeepSeek proxy compatibility."},
+            "fallback_models": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Fallback model list tried after the requested model fails."},
             "member_models": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Модели участников."},
             "judge_model": {"type": "string", "default": "", "description": "Модель для judge."},
             "research_model": {"type": "string", "default": "", "description": "Модель для research missions."},
@@ -316,6 +320,7 @@ SCHEMA = {
             "use_cache": {"type": "boolean", "default": True},
             "cache_ttl_seconds": {"type": "integer", "default": CACHE_TTL},
             "force_refresh": {"type": "boolean", "default": False},
+            "dry_run": {"type": "boolean", "default": False, "description": "Return budget/latency estimate and resolved orchestration plan without model calls."},
             "collaborate": {"type": "boolean", "default": True},
             "collaboration_rounds": {"type": "integer", "default": DEFAULT_COLLABORATION_ROUNDS},
             "message_rounds": {"type": "integer", "default": 1, "description": "Раунды обмена сообщениями между агентами."},
@@ -354,12 +359,48 @@ SCHEMA = {
             "judge_timeout": {"type": "integer", "default": DEFAULT_JUDGE_TIMEOUT},
             "request_jitter_ms": {"type": "integer", "default": DEFAULT_REQUEST_JITTER_MS},
             "strict_json": {"type": "boolean", "default": False},
+            "json_schema": {"type": "object", "default": {}, "description": "Optional minimal JSON schema for strict_json judge output validation."},
             "dissent_required": {"type": "boolean", "default": False, "description": "Судья обязан перечислить dissent/objections даже при консенсусе."},
             "anti_slop": {"type": "boolean", "default": False, "description": "Каждая рекомендация должна иметь file:line/concrete detail."},
             "self_review_round": {"type": "boolean", "default": False, "description": "Post-judge self-review round для проверки unsupported claims."},
         },
         "required": ["task"],
     },
+}
+
+
+DOCTOR_SCHEMA = {
+    "name": "omnicouncil_doctor",
+    "description": "Diagnose hermes-omnicouncil plugin registration, schema parity, cache, safe-tool policy, and optional model health.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "checks": {"type": "array", "items": {"type": "string"}, "default": ["schema", "registration", "safe_tools", "cache", "deep_web", "models"]},
+            "live_model_check": {"type": "boolean", "default": False},
+            "include_cache_samples": {"type": "boolean", "default": False},
+        },
+    },
+}
+
+CACHE_LIST_SCHEMA = {
+    "name": "omnicouncil_cache_list",
+    "description": "List hermes-omnicouncil cached result files with size/mtime and optional short summaries.",
+    "parameters": {"type": "object", "properties": {"limit": {"type": "integer", "default": 20}, "include_summaries": {"type": "boolean", "default": False}}},
+}
+CACHE_GET_SCHEMA = {
+    "name": "omnicouncil_cache_get",
+    "description": "Read one cached OmniCouncil result by cache key prefix.",
+    "parameters": {"type": "object", "properties": {"cache_key": {"type": "string"}, "max_chars": {"type": "integer", "default": 12000}}, "required": ["cache_key"]},
+}
+CACHE_CLEAR_SCHEMA = {
+    "name": "omnicouncil_cache_clear",
+    "description": "Clear one cached OmniCouncil result by key prefix, or all results when all=true.",
+    "parameters": {"type": "object", "properties": {"cache_key": {"type": "string", "default": ""}, "all": {"type": "boolean", "default": False}}},
+}
+CACHE_EXPLAIN_SCHEMA = {
+    "name": "omnicouncil_cache_explain_key",
+    "description": "Explain/compute the cache key that would be used for a task/options payload.",
+    "parameters": {"type": "object", "properties": {"task": {"type": "string"}, "context": {"type": "string", "default": ""}, "mode": {"type": "string", "default": "edit_plan"}, "options": {"type": "object", "default": {}}}, "required": ["task"]},
 }
 
 SECRET_PATTERNS = [
@@ -499,6 +540,7 @@ def _resolve_models(args: dict[str, Any]) -> tuple[str, list[str], str, str]:
     return default_model, member_models, judge_model, research_model
 
 
+
 def _call_model_text(
     prompt: str,
     max_tokens: int,
@@ -509,31 +551,36 @@ def _call_model_text(
     jitter_ms: int = DEFAULT_REQUEST_JITTER_MS,
 ) -> str:
     effective_model = model or DEFAULT_MODEL
+    fallback_models = [m for m in _ACTIVE_FALLBACK_MODELS if m and m != effective_model]
+    model_chain = [effective_model] + fallback_models
     last_error: Exception | None = None
     attempts = max(1, int(retries or 0) + 1)
-    for attempt in range(attempts):
-        try:
-            _request_jitter(jitter_ms)
-            result = call_model(
-                effective_model,
-                _truncate_text(prompt, MAX_PROMPT_CONTEXT_CHARS, "…[prompt truncated]"),
-                max_tokens=max_tokens,
-                temperature=temperature,
-                retries=1,
-                timeout=timeout,
-                reasoning_effort=REASONING_EFFORT,
-            )
-            if not result or not result.get("content"):
-                raise RuntimeError("empty model response")
-            return str(result.get("content", ""))
-        except Exception as exc:
-            last_error = exc
-            if attempt + 1 >= attempts:
-                break
-            delay = min(2**attempt, 8) + min(0.25 * attempt, 0.75)
-            time.sleep(delay)
+    prompt_text = _truncate_text(prompt, MAX_PROMPT_CONTEXT_CHARS, "…[prompt truncated]")
+    for candidate_model in model_chain:
+        for attempt in range(attempts):
+            try:
+                _request_jitter(jitter_ms)
+                result = call_model(
+                    candidate_model,
+                    prompt_text,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    retries=1,
+                    timeout=timeout,
+                    reasoning_effort=REASONING_EFFORT,
+                )
+                if not result or not result.get("content"):
+                    raise RuntimeError("empty model response")
+                return str(result.get("content", ""))
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 >= attempts:
+                    break
+                delay = min(2**attempt, 8) + min(0.25 * attempt, 0.75)
+                time.sleep(delay)
+        if fallback_models:
+            logger.warning("model %s failed, trying fallback chain: %s", candidate_model, last_error)
     raise RuntimeError(str(last_error or "model call failed"))
-
 
 def _is_retryable_error_text(exc: Exception) -> bool:
     msg = str(exc).lower()
@@ -543,37 +590,42 @@ def _is_retryable_error_text(exc: Exception) -> bool:
 # ═══════════════════════════════════════════════════════════════
 #  Safe tool execution (read-only)
 # ═══════════════════════════════════════════════════════════════
-def _execute_safe_tool(tool_name: str, tool_args: dict[str, Any]) -> dict[str, Any]:
+
+def _await_if_needed(result: Any) -> Any:
+    """Resolve coroutine/awaitable tool results from sync broker code."""
+    if not inspect.isawaitable(result):
+        return result
+    try:
+        return asyncio.run(result)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(result)
+        finally:
+            loop.close()
+
+
+def _call_runtime_tool(tool_name: str, tool_args: dict[str, Any]) -> Any:
     tool_name = str(tool_name or "").strip()
-    if tool_name not in SAFE_AGENT_TOOLS:
-        return {"ok": False, "error": "tool_not_allowed", "tool": tool_name}
     if not isinstance(tool_args, dict):
         tool_args = {}
     ctx = _RUNTIME_CTX
     if ctx is not None:
-        # ── Способ 1: call_tool / invoke_tool / run_tool / execute_tool ──
         for method_name in ("call_tool", "invoke_tool", "run_tool", "execute_tool"):
             method = getattr(ctx, method_name, None)
             if not callable(method):
                 continue
-            try:
-                result = method(tool_name, tool_args)
-                return _redact(str(result)) if not isinstance(result, dict) else result
-            except TypeError:
+            for call in (
+                lambda: method(tool_name, tool_args),
+                lambda: method(name=tool_name, arguments=tool_args),
+                lambda: method({"name": tool_name, "arguments": tool_args}),
+            ):
                 try:
-                    result = method(name=tool_name, arguments=tool_args)
-                    return _redact(str(result)) if not isinstance(result, dict) else result
+                    return _await_if_needed(call())
                 except TypeError:
-                    try:
-                        result = method({"name": tool_name, "arguments": tool_args})
-                        return _redact(str(result)) if not isinstance(result, dict) else result
-                    except Exception:
-                        continue
+                    continue
                 except Exception:
                     continue
-            except Exception:
-                continue
-        # ── Способ 2: прямой вызов tool-функции из tool_registry/plugins ──
         for registry_attr in ("tools", "tool_registry", "_tools", "_tool_registry", "registered_tools"):
             registry = getattr(ctx, registry_attr, None)
             if not isinstance(registry, dict):
@@ -581,40 +633,36 @@ def _execute_safe_tool(tool_name: str, tool_args: dict[str, Any]) -> dict[str, A
             tool_entry = registry.get(tool_name)
             if tool_entry is None:
                 continue
-            handler = None
-            if callable(tool_entry):
-                handler = tool_entry
-            elif isinstance(tool_entry, dict):
+            handler = tool_entry if callable(tool_entry) else None
+            if isinstance(tool_entry, dict):
                 handler = tool_entry.get("handler") or tool_entry.get("fn") or tool_entry.get("callable")
             if not callable(handler):
                 continue
-            try:
-                result = handler(tool_args)
-                return _redact(str(result)) if not isinstance(result, dict) else result
-            except TypeError:
+            for call in (lambda: handler(tool_args), lambda: handler(**tool_args)):
                 try:
-                    result = handler(**tool_args)
-                    return _redact(str(result)) if not isinstance(result, dict) else result
+                    return _await_if_needed(call())
+                except TypeError:
+                    continue
                 except Exception:
                     continue
-            except Exception:
-                continue
-        # ── Способ 3: getattr(ctx, tool_name) ──
         direct = getattr(ctx, tool_name, None)
         if callable(direct):
-            try:
-                result = direct(tool_args)
-                return _redact(str(result)) if not isinstance(result, dict) else result
-            except TypeError:
+            for call in (lambda: direct(tool_args), lambda: direct(**tool_args)):
                 try:
-                    result = direct(**tool_args)
-                    return _redact(str(result)) if not isinstance(result, dict) else result
+                    return _await_if_needed(call())
+                except TypeError:
+                    continue
                 except Exception:
-                    pass
-            except Exception:
-                pass
+                    continue
     return {"ok": False, "error": "tool_invoker_unavailable", "tool": tool_name}
 
+
+def _execute_safe_tool(tool_name: str, tool_args: dict[str, Any]) -> dict[str, Any] | str:
+    tool_name = str(tool_name or "").strip()
+    if tool_name not in SAFE_AGENT_TOOLS:
+        return {"ok": False, "error": "tool_not_allowed", "tool": tool_name}
+    result = _call_runtime_tool(tool_name, tool_args if isinstance(tool_args, dict) else {})
+    return _redact(str(result)) if not isinstance(result, dict) else result
 
 def _tool_result_preview(result: Any, max_chars: int = 6000) -> dict[str, Any]:
     """Return a bounded/redacted result object suitable for agent prompts."""
@@ -942,10 +990,12 @@ def _agentic_perspectives(custom: Any = None) -> list[str]:
     return out
 
 
-def _member_identity(council_i: int, member_i: int, perspectives: list[str] | None = None) -> tuple[str, str]:
+
+def _member_identity(council_i: int, member_i: int, perspectives: list[str] | None = None, members_per_council: int = DEFAULT_MEMBERS_PER_COUNCIL) -> tuple[str, str]:
     label = f"C{council_i + 1}M{member_i + 1}"
     roles = perspectives or PERSPECTIVES
-    perspective = roles[member_i % len(roles)].split(":", 1)[0]
+    global_index = council_i * max(1, int(members_per_council or 1)) + member_i
+    perspective = roles[global_index % len(roles)].split(":", 1)[0]
     return label, perspective
 
 
@@ -956,15 +1006,23 @@ def _member_prompt(
     councils: int = DEFAULT_COUNCILS, decision_policy: str = "judge", red_team: bool = False,
     blackboard: dict[str, Any] | None = None, messages: list[dict[str, Any]] | None = None,
     member_model: str = DEFAULT_MODEL,
+    members_per_council: int = DEFAULT_MEMBERS_PER_COUNCIL,
 ) -> str:
     roles = perspectives or PERSPECTIVES
-    perspective = roles[member_i % len(roles)]
+    global_index = council_i * max(1, int(members_per_council or 1)) + member_i
+    perspective = roles[global_index % len(roles)]
+    tools_enabled = (manifest.get("tool_mode") != "off") and max_tool_requests > 0
     role_rules = ""
-    if red_team and member_i == 0:
+    if red_team and "red_team" in perspective.lower():
         role_rules += "\nRed-team duty: deliberately attack the proposed plan, look for hidden failures, cheapest falsification tests."
     if decision_policy != "judge":
         role_rules += f"\nDecision policy hint: prepare explicit votes/objections suitable for `{decision_policy}` synthesis."
 
+    tool_contract_line = (
+        "- При необходимости фактов — выполни tool request в блоке TOOL_REQUESTS_JSON."
+        if tools_enabled else
+        "- Tools disabled for this run: НЕ добавляй TOOL_REQUESTS_JSON и работай только по данному контексту."
+    )
     blackboard_block = ""
     if blackboard:
         blackboard_block = f"""
@@ -972,10 +1030,11 @@ Shared blackboard:
 {_truncate_text(_json(blackboard), 20_000)}
 
 Agentic collaboration contract:
-- Используй safe tools (read-only): memory_wiki_query, read_file, search_files, web_search, web_extract.
+- Safe tools policy: {'enabled read-only broker' if tools_enabled else 'disabled'}.
 - НЕ запрашивай patch, write_file, terminal, process — они запрещены для агентов.
-- При необходимости фактов — выполни tool request в блоке TOOL_REQUESTS_JSON.
-- Всегда добавляй секцию Blackboard update: Facts/Assumptions/Open questions/Actions/Objections.
+{tool_contract_line}
+- Добавь BLACKBOARD_UPDATE_JSON: {{"facts":[],"assumptions":[],"open_questions":[],"actions":[],"objections":[],"evidence_refs":[]}}.
+- Добавь VOTE_JSON: {{"vote":"approve|revise|reject","confidence":0.0,"risk":"low|medium|high","blocking_objections":[]}}.
 - Отвечай на сообщения других агентов, если они к тебе обращаются.
 """
 
@@ -995,7 +1054,8 @@ Message board (сообщения, адресованные тебе или вс
 [{{"to":"C2M1","type":"question","content":"..."}}]
 """
 
-    capability_block = f"""
+    if tools_enabled:
+        capability_block = f"""
 Доступные safe tools (read-only):
 {_truncate_text(_json(SAFE_AGENT_TOOLS), 3000)}
 
@@ -1004,8 +1064,10 @@ Tool request protocol:
 - Каждый запрос: {{"tool":"memory_wiki_query|read_file|web_search|web_extract|...", "args":{{}}, "reason":"...", "priority":1-5}}
 - Ты не вызываешь tools напрямую, но можешь запросить их выполнение.
 """
+    else:
+        capability_block = "\nTool request protocol: disabled for this run. Do not emit TOOL_REQUESTS_JSON.\n"
 
-    return f"""Ты участник {council_i + 1}/{councils} OmniCouncil (Hermes OmniCouncil v5.1).
+    return f"""Ты участник {council_i + 1}/{councils} OmniCouncil (Hermes OmniCouncil v5.2).
 Модель: {member_model}
 Перспектива: {perspective}
 Режим: {mode}
@@ -1014,8 +1076,9 @@ Decision policy: {decision_policy}
 
 Правила:
 - Дай практически применимый результат, не философию.
-- Используй доступные safe tools для поиска фактов (web_search, read_file, memory_wiki_query).
-- При agentic blackboard режиме добавляй Blackboard update: секцию.
+- Если tools включены — запрашивай только safe read-only факты; если выключены — не запрашивай tools.
+- При agentic blackboard режиме добавляй BLACKBOARD_UPDATE_JSON.
+- Всегда добавляй VOTE_JSON для consensus/voting engine.
 - Ты можешь общаться с другими агентами через Messages: секцию.
 - После ответа других агентов укажи, изменилось ли твоё мнение.
 - Сохраняй возможность для главного ассистента сразу выполнить правки.
@@ -1028,7 +1091,6 @@ Decision policy: {decision_policy}
 Задача:
 {task}
 """
-
 
 # ═══════════════════════════════════════════════════════════════
 #  Parse tool requests / messages from agent answer
@@ -1162,6 +1224,148 @@ def _dedupe_tool_requests(answers: list[dict[str, Any]], max_items: int, minimum
     return out[:limit]
 
 
+
+def _json_value_after_marker(text: str, marker: str, openers: str = "[{") -> str:
+    m = re.search(rf"{re.escape(marker)}\s*:\s*", text or "", flags=re.IGNORECASE)
+    if not m:
+        return ""
+    starts = [(text.find(ch, m.end()), ch) for ch in openers]
+    starts = [(idx, ch) for idx, ch in starts if idx >= 0]
+    if not starts:
+        return ""
+    start, opener = min(starts, key=lambda x: x[0])
+    closer = "]" if opener == "[" else "}"
+    depth = 0
+    in_str = False
+    escape = False
+    for idx in range(start, len(text)):
+        ch = text[idx]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                return text[start:idx + 1]
+    return ""
+
+
+def _extract_blackboard_update(text: str) -> dict[str, Any]:
+    raw = _json_value_after_marker(text or "", "BLACKBOARD_UPDATE_JSON", "{")
+    if not raw:
+        raw = _json_value_after_marker(text or "", "Blackboard update", "{")
+    if not raw:
+        return {}
+    try:
+        data = _safe_json_loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _extract_vote(text: str) -> dict[str, Any]:
+    raw = _json_value_after_marker(text or "", "VOTE_JSON", "{")
+    if not raw:
+        return {}
+    try:
+        data = _safe_json_loads(raw)
+        if not isinstance(data, dict):
+            return {}
+    except Exception:
+        return {}
+    vote = str(data.get("vote") or "revise").lower().strip()
+    if vote not in {"approve", "revise", "reject", "abstain"}:
+        vote = "revise"
+    risk = str(data.get("risk") or "medium").lower().strip()
+    if risk not in {"low", "medium", "high"}:
+        risk = "medium"
+    try:
+        confidence = float(data.get("confidence", 0.5))
+    except Exception:
+        confidence = 0.5
+    return {
+        "vote": vote,
+        "confidence": max(0.0, min(1.0, confidence)),
+        "risk": risk,
+        "blocking_objections": [_truncate_text(x, 500) for x in _as_str_list(data.get("blocking_objections"))[:12]],
+        "rationale": _truncate_text(data.get("rationale", ""), 800),
+    }
+
+
+def _merge_blackboard_update(blackboard: dict[str, Any], label: str, update: dict[str, Any]) -> None:
+    if not isinstance(update, dict) or not update:
+        return
+    mapping = {
+        "facts": "facts",
+        "assumptions": "assumptions",
+        "open_questions": "open_questions",
+        "actions": "actions",
+        "proposed_actions": "actions",
+        "objections": "objections",
+        "evidence_refs": "evidence_refs",
+    }
+    blackboard.setdefault("updates", [])
+    blackboard["updates"].append({"from": label, "update": _tool_result_preview(update, 3000)})
+    for source_key, target_key in mapping.items():
+        values = update.get(source_key)
+        if values is None:
+            continue
+        blackboard.setdefault(target_key, [])
+        if not isinstance(values, list):
+            values = [values]
+        for value in values[:20]:
+            item = {"from": label, "text": _truncate_text(value, 1000)}
+            if item not in blackboard[target_key]:
+                blackboard[target_key].append(item)
+
+
+def _merge_blackboard_from_responses(blackboard: dict[str, Any], responses: list[dict[str, Any]]) -> None:
+    for item in responses:
+        if not isinstance(item, dict) or item.get("status") != "success":
+            continue
+        update = item.get("blackboard_update") or _extract_blackboard_update(item.get("answer") or item.get("response") or item.get("report") or "")
+        _merge_blackboard_update(blackboard, str(item.get("label") or item.get("mission") or "unknown"), update)
+
+
+def _aggregate_votes(responses: list[dict[str, Any]]) -> dict[str, Any]:
+    votes: list[dict[str, Any]] = []
+    for item in responses:
+        if not isinstance(item, dict) or item.get("status") != "success":
+            continue
+        vote = item.get("vote") or _extract_vote(item.get("answer") or item.get("response") or item.get("report") or "")
+        if vote:
+            vote = dict(vote)
+            vote["from"] = item.get("label") or item.get("mission") or "unknown"
+            votes.append(vote)
+    counts = {"approve": 0, "revise": 0, "reject": 0, "abstain": 0}
+    risks = {"low": 0, "medium": 0, "high": 0}
+    confidence_sum = 0.0
+    objections: list[dict[str, Any]] = []
+    for vote in votes:
+        counts[vote.get("vote", "revise")] = counts.get(vote.get("vote", "revise"), 0) + 1
+        risks[vote.get("risk", "medium")] = risks.get(vote.get("risk", "medium"), 0) + 1
+        confidence_sum += float(vote.get("confidence", 0.0) or 0.0)
+        for obj in vote.get("blocking_objections", []) or []:
+            objections.append({"from": vote.get("from"), "objection": _truncate_text(obj, 500)})
+    winner = max(counts.items(), key=lambda kv: kv[1])[0] if votes else "none"
+    return {
+        "votes": votes,
+        "counts": counts,
+        "risk_counts": risks,
+        "majority": winner,
+        "average_confidence": round(confidence_sum / len(votes), 3) if votes else 0.0,
+        "blocking_objections": objections[:40],
+    }
+
 # ═══════════════════════════════════════════════════════════════
 #  Call member / collaboration / message rounds
 # ═══════════════════════════════════════════════════════════════
@@ -1176,15 +1380,16 @@ def _call_member(
     blackboard: dict[str, Any] | None = None,
     messages: list[dict[str, Any]] | None = None,
     member_model: str = DEFAULT_MODEL,
+    members_per_council: int = DEFAULT_MEMBERS_PER_COUNCIL,
 ) -> dict[str, Any]:
-    label, perspective = _member_identity(council_i, member_i, perspectives)
+    label, perspective = _member_identity(council_i, member_i, perspectives, members_per_council)
     try:
         started = time.time()
         prompt = _member_prompt(
             task, context, mode, council_i, member_i, manifest, ledger,
             output_format, max_tool_requests, perspectives, councils,
             decision_policy, red_team, blackboard=blackboard, messages=messages,
-            member_model=member_model,
+            member_model=member_model, members_per_council=members_per_council,
         )
         answer = _call_model_text(prompt, max_tokens, 0.05 + (member_i * 0.05), model=member_model, timeout=timeout, retries=retries, jitter_ms=jitter_ms)
         return {
@@ -1192,6 +1397,8 @@ def _call_member(
             "perspective": perspective, "status": "success", "answer": answer,
             "tool_requests": _extract_tool_requests(answer, max_tool_requests),
             "messages_out": _extract_messages(answer),
+            "blackboard_update": _extract_blackboard_update(answer),
+            "vote": _extract_vote(answer),
             "model": member_model,
             "seconds": round(time.time() - started, 1),
         }
@@ -1246,6 +1453,9 @@ def _collaboration_prompt(
         if relevant:
             message_block = f"Messages для тебя:\n{_truncate_text(_json(relevant), MAX_MESSAGE_HISTORY_CHARS)}\n"
 
+    tools_enabled = (manifest.get("tool_mode") != "off") and max_tool_requests > 0
+    tool_instruction = "- используй TOOL_REQUESTS_JSON: для safe tools;" if tools_enabled else "- tools disabled: не добавляй TOOL_REQUESTS_JSON;"
+
     prompt = f"""Ты {member.get('label')} / {member.get('perspective')} в OmniCouncil (модель: {member_model}).
 Раунд командного обсуждения: {round_no}
 
@@ -1271,11 +1481,12 @@ Aggregated tool requests:
 - прямо ссылайся на идеи коллег по label;
 - найди противоречия, скрытые риски, edge cases;
 - улучши общий план;
-- используй TOOL_REQUESTS_JSON: для safe tools;
+{tool_instruction}
 - общайся с другими агентами через Messages: секцию;
+- добавь BLACKBOARD_UPDATE_JSON и VOTE_JSON.
 - закончи блоками Blackboard update: и Мой обновлённый вклад:.
 
-Safe tools: memory_wiki_query, read_file, search_files, web_search, web_extract.
+Safe tools: {"enabled" if tools_enabled else "disabled"}.
 """
     if _prompt_too_large(prompt):
         prompt = prompt.replace(initial, _format_answers(initial_answers, max_chars=900)).replace(previous, _format_answers(initial_answers, max_chars=800))
@@ -1309,6 +1520,8 @@ def _call_collaboration_member(
             "status": "success", "response": response,
             "tool_requests": _extract_tool_requests(response, max_tool_requests),
             "messages_out": _extract_messages(response),
+            "blackboard_update": _extract_blackboard_update(response),
+            "vote": _extract_vote(response),
             "model": member_model,
             "seconds": round(time.time() - started, 1),
         }
@@ -1419,6 +1632,7 @@ def _run_message_rounds(
     return transcript, all_messages
 
 
+
 def _call_message_round_member(
     task: str, context: str, mode: str, member: dict[str, Any],
     initial_answers: list[dict[str, Any]], all_messages: list[dict[str, Any]],
@@ -1432,6 +1646,8 @@ def _call_message_round_member(
     try:
         my_label = member.get("label", "")
         relevant = [m for m in all_messages if m.get("to") in (None, my_label, "all")]
+        tools_enabled = (manifest.get("tool_mode") != "off") and max_tool_requests > 0
+        tool_instruction = "Также можешь запрашивать safe tools через TOOL_REQUESTS_JSON." if tools_enabled else "Tools disabled: не добавляй TOOL_REQUESTS_JSON."
         prompt = f"""Ты {my_label} / {member.get('perspective')} в OmniCouncil, message round {round_no}.
 
 Другие агенты отправили тебе сообщения. Прочитай их и ответь.
@@ -1445,18 +1661,20 @@ def _call_message_round_member(
 Ты можешь ответить другим агентам через секцию Messages: в формате JSON:
 [{{"to":"C2M1","type":"question|answer|challenge|clarification","content":"твой ответ"}}]
 
-Также можешь запрашивать safe tools через TOOL_REQUESTS_JSON.
+{tool_instruction}
+Добавь BLACKBOARD_UPDATE_JSON и VOTE_JSON, если твоё мнение изменилось.
 """
         answer = _call_model_text(prompt, max_tokens, 0.08, model=member_model, timeout=timeout, retries=retries, jitter_ms=jitter_ms)
         return {
             "label": my_label, "status": "success", "response": answer,
             "messages_out": _extract_messages(answer),
             "tool_requests": _extract_tool_requests(answer, max_tool_requests),
+            "blackboard_update": _extract_blackboard_update(answer),
+            "vote": _extract_vote(answer),
             "model": member_model,
         }
     except Exception as exc:
         return {"label": member.get("label"), "status": "failed", "error": _truncate_text(str(exc), 500)}
-
 
 # ═══════════════════════════════════════════════════════════════
 #  Judge
@@ -1495,6 +1713,7 @@ def _judge_prompt(
     research = _format_answers(research_reports, field="report", max_chars=MAX_RESEARCH_REPORT_CHARS_FOR_JUDGE) if research_reports else ""
 
     msg_text = _truncate_text(_json(messages), MAX_MESSAGE_HISTORY_CHARS) if messages else ""
+    vote_summary = _aggregate_votes(answers + [r for t in transcript for r in t.get("responses", [])])
 
     decision_rule = {
         "judge": "Use best-evidence judgement; do not average weak arguments.",
@@ -1552,6 +1771,9 @@ Decision policy: {decision_policy}
 Сообщения агентов:
 {msg_text}
 
+Structured vote summary:
+{_truncate_text(_json(vote_summary), 12_000)}
+
 Aggregated tool requests:
 {_truncate_text(_json(tool_requests), 20_000)}
 
@@ -1578,6 +1800,7 @@ def _judge(
     timeout: int = DEFAULT_JUDGE_TIMEOUT, retries: int = DEFAULT_MEMBER_RETRIES,
     strict_json: bool = False, decision_policy: str = "judge", red_team: bool = False,
     jitter_ms: int = DEFAULT_REQUEST_JITTER_MS,
+    json_schema: dict[str, Any] | None = None,
     judge_model: str = DEFAULT_MODEL,
     dissent_required: bool = False,
     anti_slop: bool = False,
@@ -1594,11 +1817,37 @@ def _judge(
         try:
             parsed = _safe_json_loads(content)
             if isinstance(parsed, dict):
+                schema_errors = _validate_json_schema_minimal(parsed, json_schema)
+                if schema_errors:
+                    return _json({"status": "partial", "warning": "judge_output_schema_validation_failed", "schema_errors": schema_errors, "synthesis_json": parsed})
                 return _json(parsed)
         except Exception:
             return _json({"status": "partial", "warning": "judge_output_was_not_valid_json", "synthesis_text": content})
     return content
 
+
+
+def _validate_json_schema_minimal(data: Any, schema: dict[str, Any] | None) -> list[str]:
+    """Tiny dependency-free validator for object required/type checks."""
+    if not schema:
+        return []
+    errors: list[str] = []
+    if schema.get("type") == "object" and not isinstance(data, dict):
+        return ["root: expected object"]
+    if not isinstance(data, dict):
+        return errors
+    for key in schema.get("required", []) or []:
+        if key not in data:
+            errors.append(f"{key}: required")
+    type_map = {"string": str, "array": list, "object": dict, "boolean": bool, "integer": int, "number": (int, float)}
+    for key, prop in (schema.get("properties") or {}).items():
+        if key not in data or not isinstance(prop, dict) or "type" not in prop:
+            continue
+        expected = prop.get("type")
+        py_type = type_map.get(expected)
+        if py_type and not isinstance(data[key], py_type):
+            errors.append(f"{key}: expected {expected}, got {type(data[key]).__name__}")
+    return errors
 
 # ═══════════════════════════════════════════════════════════════
 #  Research missions
@@ -1705,27 +1954,37 @@ def _cache_key(task: str, context: str, mode: str, options: dict[str, Any], mani
 # ═══════════════════════════════════════════════════════════════
 #  Preset defaults
 # ═══════════════════════════════════════════════════════════════
+
 def _complexity_score(task: str, context: str) -> int:
     combined = (task + " " + context).lower()
-    score = 2
-    for kw in ("migration", "deploy", "production", "database", "security", "auth", "race condition"):
+    score = 0
+    if len(combined.strip()) < 120:
+        score += 1
+    for kw in (
+        "migration", "deploy", "production", "database", "security", "auth", "race condition",
+        "rollback", "incident", "outage", "payment", "secret", "multi-agent", "architecture",
+        "patch", "refactor", "audit", "browser", "server", "memory", "schema",
+    ):
         if kw in combined:
             score += 1
     if len(combined) > 600:
         score += 1
-    return min(8, score)
+    if len(combined) > 2000:
+        score += 2
+    if len(combined) > 6000:
+        score += 2
+    return min(12, score)
 
 
 def _auto_scale(task: str, context: str) -> dict[str, Any]:
     score = _complexity_score(task, context)
-    if score <= 1:
-        return {"councils": 2, "members_per_council": 3, "collaboration_rounds": 0, "message_rounds": 0, "research_missions": False}
-    if score <= 4:
-        return {"councils": 3, "members_per_council": 4, "collaboration_rounds": 1, "message_rounds": 0, "research_missions": False}
+    if score <= 2:
+        return {"councils": 2, "members_per_council": 3, "collaboration_rounds": 0, "message_rounds": 0, "research_missions": False, "complexity_score": score}
+    if score <= 5:
+        return {"councils": 3, "members_per_council": 4, "collaboration_rounds": 1, "message_rounds": 0, "research_missions": False, "complexity_score": score}
     if score <= 8:
-        return {"councils": 5, "members_per_council": 4, "collaboration_rounds": 2, "message_rounds": 1, "research_missions": True}
-    return {"councils": 6, "members_per_council": 5, "collaboration_rounds": 2, "message_rounds": 2, "research_missions": True, "red_team": True}
-
+        return {"councils": 5, "members_per_council": 4, "collaboration_rounds": 2, "message_rounds": 1, "research_missions": True, "complexity_score": score}
+    return {"councils": 6, "members_per_council": 5, "collaboration_rounds": 2, "message_rounds": 2, "research_missions": True, "red_team": True, "complexity_score": score}
 
 def _apply_preset_defaults(args: dict[str, Any]) -> dict[str, Any]:
     out = dict(args)
@@ -1745,10 +2004,163 @@ def _apply_preset_defaults(args: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+
+def _estimate_budget(args: dict[str, Any], total_members: int, collaboration_rounds: int, message_rounds: int, research_missions: bool, max_research_agents: int, self_review_round: bool) -> dict[str, Any]:
+    research_calls = max_research_agents if research_missions else 0
+    primary_calls = total_members
+    collaboration_calls = total_members * max(0, collaboration_rounds)
+    message_calls = total_members * max(0, message_rounds)
+    judge_calls = 1 + (1 if self_review_round else 0)
+    total_calls = primary_calls + collaboration_calls + message_calls + research_calls + judge_calls
+    context_len = len(str(args.get("context") or "")) + len(str(args.get("task") or ""))
+    rough_input_chars = total_calls * min(MAX_PROMPT_CONTEXT_CHARS, max(4000, context_len + 6000))
+    rough_output_tokens = total_calls * min(int(args.get("max_tokens") or DEFAULT_MAX_TOKENS), 32000)
+    return {
+        "model_calls": total_calls,
+        "breakdown": {"primary": primary_calls, "collaboration": collaboration_calls, "message": message_calls, "research": research_calls, "judge": judge_calls},
+        "rough_input_chars_upper": rough_input_chars,
+        "rough_output_tokens_upper": rough_output_tokens,
+        "latency_hint_seconds": f"{max(10, total_calls * 4)}-{max(30, total_calls * 18)}",
+        "expensive": total_calls >= 20 or rough_output_tokens > 250000,
+    }
+
+
+def _save_task_capsule(task: str, synthesis: str, result: dict[str, Any], ledger: list[dict[str, Any]], tool_requests: list[dict[str, Any]]) -> dict[str, Any]:
+    payload = {
+        "intent": task,
+        "topic": "hermes_omnicouncil",
+        "plan": _truncate_text(synthesis, 6000),
+        "files": [],
+        "commands": [],
+        "errors": [e.get("error", "") for e in result.get("member_errors", []) if e.get("error")][:20],
+        "fixes": [],
+        "verification": _truncate_text(_json({"diagnostics": result.get("diagnostics", {}), "evidence_count": len(ledger), "tool_requests": len(tool_requests)}), 3000),
+        "followups": [],
+    }
+    raw = _call_runtime_tool("memory_wiki_add_task_capsule", payload)
+    return _tool_result_preview(raw, 4000)
+
+
+def _cache_files() -> list[Path]:
+    if not CACHE_DIR.exists():
+        return []
+    return sorted(CACHE_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+
+
+def _cache_find(prefix: str) -> Path | None:
+    prefix = str(prefix or "").strip()
+    if not prefix:
+        return None
+    for path in _cache_files():
+        if path.stem.startswith(prefix):
+            return path
+    return None
+
+
+def _handle_cache_list(args=None, **_kw):
+    args = dict(args or {})
+    limit = _clamp_int(args.get("limit"), 20, 1, 200)
+    include_summaries = _normalise_bool(args.get("include_summaries"), False)
+    items = []
+    for path in _cache_files()[:limit]:
+        item = {"cache_key": path.stem, "size": path.stat().st_size, "mtime": path.stat().st_mtime}
+        if include_summaries:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                item.update({"status": data.get("status"), "task": _truncate_text(data.get("synthesis", ""), 500), "seconds": data.get("seconds")})
+            except Exception as exc:
+                item["error"] = _truncate_text(str(exc), 200)
+        items.append(item)
+    return _json({"status": "success", "cache_dir": str(CACHE_DIR), "count": len(items), "items": items})
+
+
+def _handle_cache_get(args=None, **_kw):
+    args = dict(args or {})
+    path = _cache_find(args.get("cache_key", ""))
+    if not path:
+        return _json({"status": "error", "error": "cache_key_not_found"})
+    max_chars = _clamp_int(args.get("max_chars"), 12000, 1000, 200000)
+    return _truncate_text(path.read_text(encoding="utf-8", errors="replace"), max_chars)
+
+
+def _handle_cache_clear(args=None, **_kw):
+    args = dict(args or {})
+    if _normalise_bool(args.get("all"), False):
+        files = _cache_files()
+    else:
+        found = _cache_find(args.get("cache_key", ""))
+        files = [found] if found else []
+    removed = []
+    for path in files:
+        if path and path.exists():
+            path.unlink()
+            removed.append(path.stem)
+    return _json({"status": "success", "removed": removed, "count": len(removed)})
+
+
+def _handle_cache_explain(args=None, **_kw):
+    args = dict(args or {})
+    task = str(args.get("task") or "")
+    if not task:
+        return _json({"status": "error", "error": "task is required"})
+    options = args.get("options") if isinstance(args.get("options"), dict) else {}
+    resolved = _apply_preset_defaults({**options, "task": task, "context": args.get("context", "")})
+    default_model, _members, _judge, _research = _resolve_models(resolved)
+    ledger: list[dict[str, Any]] = []
+    manifest = _build_capability_manifest(resolved, ledger)
+    key = _cache_key(task, str(args.get("context") or ""), str(args.get("mode") or "edit_plan"), resolved, manifest, default_model)
+    return _json({"status": "success", "cache_key": key, "cache_path": str(CACHE_DIR / f"{key}.json"), "manifest_evidence": ledger})
+
+
+def _handle_doctor(args=None, **_kw):
+    global _RUNTIME_CTX
+    args = dict(args or {})
+    checks = set(_as_str_list(args.get("checks")) or ["schema", "registration", "safe_tools", "cache", "deep_web", "models"])
+    report: dict[str, Any] = {"status": "success", "tool": "omnicouncil_doctor", "version": VERSION, "checks": {}, "warnings": []}
+    if "schema" in checks:
+        props = SCHEMA.get("parameters", {}).get("properties", {})
+        report["checks"]["schema"] = {"ok": "task" in SCHEMA.get("parameters", {}).get("required", []), "property_count": len(props), "has_dry_run": "dry_run" in props, "has_fallback_models": "fallback_models" in props}
+    if "registration" in checks:
+        class FakeCtx:
+            def __init__(self):
+                self.tools = []
+            def register_tool(self, **kwargs):
+                self.tools.append(kwargs)
+        ctx = FakeCtx()
+        old_runtime_ctx = _RUNTIME_CTX
+        try:
+            register(ctx)
+        finally:
+            _RUNTIME_CTX = old_runtime_ctx
+        report["checks"]["registration"] = {"ok": True, "tools": [t.get("name") for t in ctx.tools], "count": len(ctx.tools)}
+    if "safe_tools" in checks:
+        blocked = _extract_tool_requests('TOOL_REQUESTS_JSON: [{"tool":"patch","args":{}},{"tool":"terminal","args":{}}]', 10)
+        report["checks"]["safe_tools"] = {"ok": blocked == [], "allowed": SAFE_AGENT_TOOLS, "blocked_probe_count": len(blocked)}
+    if "cache" in checks:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        report["checks"]["cache"] = {"ok": CACHE_DIR.exists(), "path": str(CACHE_DIR), "files": len(_cache_files())}
+        if _normalise_bool(args.get("include_cache_samples"), False):
+            report["checks"]["cache"]["samples"] = [p.stem for p in _cache_files()[:5]]
+    if "deep_web" in checks:
+        report["checks"]["deep_web"] = {"ok": hasattr(_deep_web_research, "handler"), "version": getattr(_deep_web_research, "VERSION", ""), "has_management_schemas": bool(getattr(_deep_web_research, "MANAGEMENT_SCHEMAS", []))}
+    if "models" in checks:
+        if _normalise_bool(args.get("live_model_check"), False):
+            try:
+                started = time.time()
+                content = _call_model_text("Return exactly OK", 16, 0.0, timeout=30, retries=0, jitter_ms=0)
+                report["checks"]["models"] = {"ok": bool(content), "content": _truncate_text(content, 80), "elapsed_ms": int((time.time() - started) * 1000)}
+            except Exception as exc:
+                report["checks"]["models"] = {"ok": False, "error": _truncate_text(str(exc), 500)}
+                report["status"] = "partial"
+        else:
+            report["checks"]["models"] = {"ok": True, "live_model_check": False}
+    return _json(report)
+
 # ═══════════════════════════════════════════════════════════════
 #  MAIN HANDLER — omnicouncil orchestration
 # ═══════════════════════════════════════════════════════════════
 def handler(args=None, **_kw):
+    global _ACTIVE_FALLBACK_MODELS
     if args is None:
         args = {k: v for k, v in _kw.items() if k not in {"task_id", "ctx"}}
     else:
@@ -1768,6 +2180,7 @@ def handler(args=None, **_kw):
 
     # ── Model resolution
     default_model, member_models, judge_model, research_model = _resolve_models(args)
+    _ACTIVE_FALLBACK_MODELS = _as_str_list(args.get("fallback_models"))
 
     # ── Parse args
     councils = _clamp_int(args.get("councils"), DEFAULT_COUNCILS, 1, MAX_COUNCILS)
@@ -1812,6 +2225,8 @@ def handler(args=None, **_kw):
     judge_timeout = _clamp_int(args.get("judge_timeout"), DEFAULT_JUDGE_TIMEOUT, 30, 3600)
     request_jitter_ms = _clamp_int(args.get("request_jitter_ms"), DEFAULT_REQUEST_JITTER_MS, 0, MAX_REQUEST_JITTER_MS)
     strict_json = _normalise_bool(args.get("strict_json"), False)
+    json_schema = args.get("json_schema") if isinstance(args.get("json_schema"), dict) else {}
+    dry_run = _normalise_bool(args.get("dry_run"), False)
     dissent_required = _normalise_bool(args.get("dissent_required"), False)
     anti_slop = _normalise_bool(args.get("anti_slop"), False)
     self_review_round = _normalise_bool(args.get("self_review_round"), False)
@@ -1829,6 +2244,25 @@ def handler(args=None, **_kw):
     # ── Manifest
     manifest = _build_capability_manifest({**args, "tool_mode": tool_mode, "agentic_blackboard": agentic_blackboard, "minimum_tools": minimum_tools, "brokered_tools": brokered_tools, "active_tool_agents": active_tool_agents, "mutating_agents": mutating_agents, "max_tool_requests": max_tool_requests}, ledger)
 
+    if dry_run:
+        estimate = _estimate_budget(args, total_members, collaboration_rounds, message_rounds, research_missions, max_research_agents, self_review_round)
+        return _json({
+            "status": "dry_run",
+            "tool": "hermes_omnicouncil",
+            "version": VERSION,
+            "preset": args.get("preset"),
+            "model": default_model,
+            "judge_model": judge_model,
+            "member_models": member_models,
+            "councils": councils,
+            "members_per_council": members_per_council,
+            "estimate": estimate,
+            "tool_mode": tool_mode,
+            "capability_profile": manifest.get("capability_profile"),
+            "fallback_models": _ACTIVE_FALLBACK_MODELS,
+            "evidence": ledger if return_evidence else [],
+        })
+
     # ── Memory prefetch
     memory_context = ""
     if auto_memory_context and memory_context_chars > 0:
@@ -1842,6 +2276,7 @@ def handler(args=None, **_kw):
         "decision_policy": decision_policy, "red_team": red_team, "agentic_blackboard": agentic_blackboard,
         "tool_mode": tool_mode, "capability_profile": manifest.get("capability_profile"),
         "dissent_required": dissent_required, "anti_slop": anti_slop, "self_review_round": self_review_round,
+        "fallback_models": _ACTIVE_FALLBACK_MODELS, "json_schema": bool(json_schema),
     }, manifest, default_model)
     cache_file = CACHE_DIR / f"{key}.json"
     if use_cache and cache_file.exists() and time.time() - cache_file.stat().st_mtime < cache_ttl_seconds:
@@ -1869,6 +2304,7 @@ def handler(args=None, **_kw):
                 member_retries, decision_policy, red_team, request_jitter_ms,
                 blackboard=blackboard,
                 member_model=member_models[(ci * members_per_council + mi) % len(member_models)],
+                members_per_council=members_per_council,
             ): (ci, mi)
             for ci in range(councils) for mi in range(members_per_council)
         }
@@ -1877,9 +2313,10 @@ def handler(args=None, **_kw):
             try:
                 answers.append(future.result())
             except Exception as exc:
-                label, perspective = _member_identity(ci, mi, perspectives)
+                label, perspective = _member_identity(ci, mi, perspectives, members_per_council)
                 answers.append({"label": label, "council": ci + 1, "member": mi + 1, "perspective": perspective, "status": "failed", "error": _truncate_text(str(exc), 500)})
     answers.sort(key=lambda item: (int(item.get("council") or 0), int(item.get("member") or 0), str(item.get("label") or "")))
+    _merge_blackboard_from_responses(blackboard, answers)
 
     succeeded = sum(1 for a in answers if a.get("status") == "success")
     tool_requests = _dedupe_tool_requests(answers, max_tool_requests, minimum_tools=minimum_tools)
@@ -1891,6 +2328,8 @@ def handler(args=None, **_kw):
         transcript = []
         message_transcript = []
         all_messages = []
+        all_responses = list(answers)
+        votes_summary = _aggregate_votes(all_responses)
         collaboration_responded = 0
         judge_error = f"primary quorum not met: {succeeded}/{min_successful_members}"
         synthesis = _fallback_synthesis(task, mode, answers, transcript, research_reports, tool_requests, judge_error)
@@ -1903,13 +2342,18 @@ def handler(args=None, **_kw):
         message_transcript, all_messages = _run_message_rounds(task, context, mode, answers, message_rounds, max_tokens, manifest, ledger, tool_requests, max_tool_requests, max_collaboration_workers, model_timeout, member_retries, request_jitter_ms, blackboard=blackboard, member_models=member_models)
 
         all_responses = answers + [r for t in transcript for r in t.get("responses", [])] + [r for t in message_transcript for r in t.get("responses", [])]
+        _merge_blackboard_from_responses(blackboard, all_responses)
+        votes_summary = _aggregate_votes(all_responses)
+        if votes_summary.get("votes"):
+            vote_count = len(votes_summary.get("votes", []))
+            _add_evidence(ledger, "structured_votes", f"Collected {vote_count} structured votes.", majority=votes_summary.get("majority"), confidence=votes_summary.get("average_confidence"))
         tool_requests = _dedupe_tool_requests(all_responses, max_tool_requests, minimum_tools=minimum_tools)
         if tool_requests:
             _execute_tool_requests(tool_requests, ledger, max_workers=max_research_workers)
         collaboration_responded = sum(1 for round_item in transcript for response in round_item.get("responses", []) if response.get("status") == "success")
 
         try:
-            synthesis = _judge(task, context, mode, answers, judge_max_tokens, transcript, manifest, ledger, research_reports, tool_requests, all_messages, output_format, save_task_capsule, timeout=judge_timeout, retries=member_retries, strict_json=strict_json, decision_policy=decision_policy, red_team=red_team, jitter_ms=request_jitter_ms, judge_model=judge_model, dissent_required=dissent_required, anti_slop=anti_slop)
+            synthesis = _judge(task, context, mode, answers, judge_max_tokens, transcript, manifest, ledger, research_reports, tool_requests, all_messages, output_format, save_task_capsule, timeout=judge_timeout, retries=member_retries, strict_json=strict_json, decision_policy=decision_policy, red_team=red_team, jitter_ms=request_jitter_ms, json_schema=json_schema, judge_model=judge_model, dissent_required=dissent_required, anti_slop=anti_slop)
             status = "success"
             judge_error = ""
 
@@ -1952,7 +2396,8 @@ def handler(args=None, **_kw):
         "judge_success": not bool(judge_error),
         "bounded_workers": {"primary": primary_workers, "collaboration": max_collaboration_workers, "research": max_research_workers},
         "agentic_blackboard": agentic_blackboard,
-        "models": {"default": default_model, "member_count": len(member_models), "judge": judge_model, "research": research_model},
+        "models": {"default": default_model, "member_count": len(member_models), "judge": judge_model, "research": research_model, "fallbacks": _ACTIVE_FALLBACK_MODELS},
+        "votes": votes_summary,
         "warnings": [],
     }
 
@@ -1985,6 +2430,8 @@ def handler(args=None, **_kw):
         "dissent_required": dissent_required,
         "anti_slop": anti_slop,
         "self_review_round": self_review_round,
+        "fallback_models": _ACTIVE_FALLBACK_MODELS,
+        "votes": votes_summary,
         "seconds": round(time.time() - started, 1),
         "synthesis": synthesis,
         "tool_requests": tool_requests,
@@ -1996,6 +2443,7 @@ def handler(args=None, **_kw):
         result["blackboard"] = {
             "policy": manifest.get("blackboard", {}),
             "summary": _blackboard_summary(answers, transcript, tool_requests, all_messages, manifest),
+            "state": _tool_result_preview(blackboard, 20000),
         }
     if all_messages:
         result["messages"] = all_messages
@@ -2006,6 +2454,8 @@ def handler(args=None, **_kw):
     if return_transcript:
         result["transcript"] = transcript
         result["message_transcript"] = message_transcript
+    if save_task_capsule:
+        result["task_capsule"] = _save_task_capsule(task, synthesis, result, ledger, tool_requests)
     if judge_error:
         result["judge_error"] = judge_error
     if succeeded < total_members:
@@ -2033,3 +2483,16 @@ def register(ctx):
         schema=_deep_web_research.SCHEMA,
         handler=_deep_web_research.handler,
     )
+    for schema, handler_fn in [
+        (DOCTOR_SCHEMA, _handle_doctor),
+        (CACHE_LIST_SCHEMA, _handle_cache_list),
+        (CACHE_GET_SCHEMA, _handle_cache_get),
+        (CACHE_CLEAR_SCHEMA, _handle_cache_clear),
+        (CACHE_EXPLAIN_SCHEMA, _handle_cache_explain),
+    ]:
+        ctx.register_tool(name=schema["name"], toolset="hermes_omnicouncil", schema=schema, handler=handler_fn)
+    for schema in getattr(_deep_web_research, "MANAGEMENT_SCHEMAS", []):
+        handler_name = schema.get("handler") or f"handle_{schema.get('name', '')}"
+        handler_fn = getattr(_deep_web_research, handler_name, None)
+        if callable(handler_fn):
+            ctx.register_tool(name=schema["name"], toolset="hermes_omnicouncil", schema=schema, handler=handler_fn)

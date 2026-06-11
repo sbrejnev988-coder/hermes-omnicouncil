@@ -1,9 +1,31 @@
 name: hermes-omnicouncil
-version: 5.1.1
-description: "Hermes OmniCouncil v5.1.1 — multi-model agentic council with shared blackboard, DeepSeek defaults, message rounds, safe memory/web/file tools, swappable models, web_research_brief, and deep_web_crawl for professional research reports."
+version: 5.2.0
+description: "Hermes OmniCouncil v5.2.0 — multi-model agentic council with structured blackboard, voting/consensus, dry-run budget estimates, model failover, doctor/cache tools, safe brokered tools, and deep_web_crawl management."
 tools:
   - hermes_omnicouncil
+  - omnicouncil_doctor
+  - omnicouncil_cache_list
+  - omnicouncil_cache_get
+  - omnicouncil_cache_clear
+  - omnicouncil_cache_explain_key
   - deep_web_crawl
+  - deep_web_status
+  - deep_web_open_report
+  - deep_web_query_sources
+  - deep_web_delete_job
+  - deep_web_export
+  - deep_web_resume
 provides_tools:
   - hermes_omnicouncil
+  - omnicouncil_doctor
+  - omnicouncil_cache_list
+  - omnicouncil_cache_get
+  - omnicouncil_cache_clear
+  - omnicouncil_cache_explain_key
   - deep_web_crawl
+  - deep_web_status
+  - deep_web_open_report
+  - deep_web_query_sources
+  - deep_web_delete_job
+  - deep_web_export
+  - deep_web_resume

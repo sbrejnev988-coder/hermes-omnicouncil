@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import html
+import ipaddress
+import socket
 import json
 import re
 import sqlite3
@@ -21,12 +23,12 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 BASE_DIR = Path.home() / ".hermes" / "cache" / "hermes-omnicouncil" / "research"
 DB_PATH = BASE_DIR / "research.db"
 REPORT_DIR = BASE_DIR / "reports"
 CACHE_DIR = BASE_DIR / "http-cache"
-USER_AGENT = "HermesDeepWebResearch/1.2 (+https://local.hermes; respects robots.txt)"
+USER_AGENT = "HermesDeepWebResearch/1.3 (+https://local.hermes; respects robots.txt)"
 MAX_FETCH_BYTES = 2_000_000
 DOMAIN_LAST_FETCH: dict[str, float] = {}
 ROBOTS_CACHE: dict[str, tuple[float, urllib.robotparser.RobotFileParser]] = {}
@@ -68,13 +70,57 @@ SCHEMA = {
             "rate_limit_seconds": {"type": "number", "default": 1.0, "description": "Minimum delay between live fetches to the same domain."},
             "timeout": {"type": "integer", "default": 0},
             "export_formats": {"type": "array", "items": {"type": "string", "enum": ["markdown", "html", "json"]}, "default": ["markdown", "html"]},
-            "include_raw": {"type": "boolean", "default": False, "description": "Include crawled page excerpts in result JSON."},
+            "include_raw": {"type": "boolean", "default": False, "description": "Include crawled page excerpts in tool response JSON."},
+            "export_raw": {"type": "boolean", "default": False, "description": "Include full page text in exported JSON report. Default false."},
+            "allow_private_urls": {"type": "boolean", "default": False, "description": "Allow loopback/private/link-local URLs. Default false to prevent local-network crawling."},
+            "allowed_domains": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Optional allowlist of domains/hosts."},
+            "blocked_domains": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Optional blocklist of domains/hosts."},
             "memory_wiki_task_capsule": {"type": "boolean", "default": False, "description": "Return a sanitized optional memory-wiki task capsule payload without raw page text."},
-            "job_id": {"type": "string", "default": "", "description": "Resume/update an existing job id; empty creates deterministic id."},
+            "job_id": {"type": "string", "default": "", "description": "Resume/update an existing job id; empty creates deterministic id from query+urls+preset."},
         },
         "required": ["query"],
     },
 }
+
+
+MANAGEMENT_SCHEMAS = [
+    {
+        "name": "deep_web_status",
+        "handler": "handle_deep_web_status",
+        "description": "Return deep_web_crawl job status, progress and recent events.",
+        "parameters": {"type": "object", "properties": {"job_id": {"type": "string"}, "limit": {"type": "integer", "default": 20}}, "required": ["job_id"]},
+    },
+    {
+        "name": "deep_web_open_report",
+        "handler": "handle_deep_web_open_report",
+        "description": "Return report file paths for a deep_web_crawl job.",
+        "parameters": {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]},
+    },
+    {
+        "name": "deep_web_query_sources",
+        "handler": "handle_deep_web_query_sources",
+        "description": "Search collected sources for a job without returning raw page text.",
+        "parameters": {"type": "object", "properties": {"job_id": {"type": "string"}, "query": {"type": "string", "default": ""}, "limit": {"type": "integer", "default": 20}}, "required": ["job_id"]},
+    },
+    {
+        "name": "deep_web_delete_job",
+        "handler": "handle_deep_web_delete_job",
+        "description": "Delete a deep_web_crawl job rows and optionally generated report files.",
+        "parameters": {"type": "object", "properties": {"job_id": {"type": "string"}, "delete_files": {"type": "boolean", "default": False}}, "required": ["job_id"]},
+    },
+    {
+        "name": "deep_web_export",
+        "handler": "handle_deep_web_export",
+        "description": "Re-export an existing deep_web_crawl job to markdown/html/json.",
+        "parameters": {"type": "object", "properties": {"job_id": {"type": "string"}, "export_formats": {"type": "array", "items": {"type": "string", "enum": ["markdown", "html", "json"]}, "default": ["markdown", "html"]}, "export_raw": {"type": "boolean", "default": False}}, "required": ["job_id"]},
+    },
+    {
+        "name": "deep_web_resume",
+        "handler": "handle_deep_web_resume",
+        "description": "Resume/re-run a deep_web_crawl job using saved query/preset and optional overrides.",
+        "parameters": {"type": "object", "properties": {"job_id": {"type": "string"}, "max_pages": {"type": "integer", "default": 0}, "max_depth": {"type": "integer", "default": -1}, "force_refresh": {"type": "boolean", "default": False}}, "required": ["job_id"]},
+    },
+]
 
 SECRET_PATTERNS = [
     re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-+/=]{12,}"),
@@ -164,6 +210,56 @@ def _domain(url: str) -> str:
     except Exception:
         return ""
 
+
+
+def _domain_matches(host: str, patterns: list[str]) -> bool:
+    host = (host or "").lower().strip(".")
+    for pat in patterns or []:
+        pat = (pat or "").lower().strip(".")
+        if not pat:
+            continue
+        if host == pat or host.endswith("." + pat):
+            return True
+    return False
+
+
+def _host_is_private(host: str) -> bool:
+    host = (host or "").strip("[]").lower()
+    if not host:
+        return True
+    if host in {"localhost", "localhost.localdomain"} or host.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return bool(ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except Exception:
+        return False
+    for info in infos[:8]:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except Exception:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+            return True
+    return False
+
+
+def _url_allowed_by_policy(url: str, allow_private_urls: bool = False, allowed_domains: list[str] | None = None, blocked_domains: list[str] | None = None) -> tuple[bool, str]:
+    clean = _clean_url(url)
+    if not clean:
+        return False, "invalid_url"
+    host = urllib.parse.urlsplit(clean).hostname or ""
+    if _domain_matches(host, blocked_domains or []):
+        return False, "blocked_domain"
+    if allowed_domains and not _domain_matches(host, allowed_domains):
+        return False, "not_in_allowed_domains"
+    if not allow_private_urls and _host_is_private(host):
+        return False, "private_url_blocked"
+    return True, "ok"
 
 def _terms(query: str) -> list[str]:
     terms = [t.lower() for t in re.findall(r"[\w\-]{3,}", query or "")]
@@ -310,7 +406,8 @@ def _rate_limit(url: str, seconds: float) -> None:
     DOMAIN_LAST_FETCH[dom] = _now()
 
 
-def _robots_allowed(url: str, timeout: int, cache_ttl_seconds: int, con: sqlite3.Connection) -> tuple[bool, str]:
+
+def _robots_allowed(url: str, timeout: int, cache_ttl_seconds: int, con: sqlite3.Connection, allow_private_urls: bool = False, allowed_domains: list[str] | None = None, blocked_domains: list[str] | None = None) -> tuple[bool, str]:
     clean = _clean_url(url)
     if not clean:
         return False, "invalid_url"
@@ -324,7 +421,7 @@ def _robots_allowed(url: str, timeout: int, cache_ttl_seconds: int, con: sqlite3
         rp = urllib.robotparser.RobotFileParser()
         rp.set_url(robots_url)
         try:
-            fetched = _fetch(robots_url, max(2, min(timeout, 10)), max(cache_ttl_seconds, 3600), False, con, respect_robots=False, rate_limit_seconds=0)
+            fetched = _fetch(robots_url, max(2, min(timeout, 10)), max(cache_ttl_seconds, 3600), False, con, respect_robots=False, rate_limit_seconds=0, allow_private_urls=allow_private_urls, allowed_domains=allowed_domains, blocked_domains=blocked_domains)
             rp.parse((fetched.get("body") or "").splitlines())
         except Exception:
             rp.parse([])
@@ -334,7 +431,6 @@ def _robots_allowed(url: str, timeout: int, cache_ttl_seconds: int, con: sqlite3
     except Exception:
         allowed = True
     return bool(allowed), robots_url
-
 
 def _extract_citations(text: str, query: str, limit: int = 5) -> list[dict[str, Any]]:
     terms = _terms(query)
@@ -370,15 +466,19 @@ def _memory_capsule(job: sqlite3.Row, pages: list[sqlite3.Row], paths: dict[str,
         ],
     }
 
-def _fetch(url: str, timeout: int, cache_ttl_seconds: int, force_refresh: bool, con: sqlite3.Connection, respect_robots: bool = True, rate_limit_seconds: float = DEFAULT_RATE_LIMIT_SECONDS) -> dict[str, Any]:
+
+def _fetch(url: str, timeout: int, cache_ttl_seconds: int, force_refresh: bool, con: sqlite3.Connection, respect_robots: bool = True, rate_limit_seconds: float = DEFAULT_RATE_LIMIT_SECONDS, allow_private_urls: bool = False, allowed_domains: list[str] | None = None, blocked_domains: list[str] | None = None) -> dict[str, Any]:
     url = _clean_url(url)
+    allowed, reason = _url_allowed_by_policy(url, allow_private_urls=allow_private_urls, allowed_domains=allowed_domains, blocked_domains=blocked_domains)
+    if not allowed:
+        return {"url": url, "status": 0, "content_type": "", "body": "", "error": reason, "cached": False, "policy_blocked": True}
     uh = _hash(url)
     if not force_refresh and cache_ttl_seconds > 0:
         row = con.execute("SELECT * FROM http_cache WHERE url_hash=?", (uh,)).fetchone()
         if row and _now() - float(row["fetched_at"] or 0) <= cache_ttl_seconds:
             return {"url": url, "status": row["status"], "content_type": row["content_type"], "body": row["body"] or "", "error": row["error"] or "", "cached": True}
     if respect_robots:
-        allowed, robots_url = _robots_allowed(url, timeout, cache_ttl_seconds, con)
+        allowed, robots_url = _robots_allowed(url, timeout, cache_ttl_seconds, con, allow_private_urls=allow_private_urls, allowed_domains=allowed_domains, blocked_domains=blocked_domains)
         if not allowed:
             return {"url": url, "status": 0, "content_type": "", "body": "", "error": f"blocked_by_robots: {robots_url}", "cached": False, "robots_blocked": True}
     _rate_limit(url, rate_limit_seconds)
@@ -399,7 +499,6 @@ def _fetch(url: str, timeout: int, cache_ttl_seconds: int, force_refresh: bool, 
     )
     con.commit()
     return {"url": url, "status": status, "content_type": ctype, "body": body, "error": error, "cached": False}
-
 
 def _parse_page(url: str, body: str, content_type: str) -> tuple[str, str, list[str]]:
     if "html" in (content_type or "").lower() or "<html" in body[:1000].lower():
@@ -662,7 +761,8 @@ li,p{{line-height:1.58}}.ranked{{padding:12px 14px;background:#f8fafc;border-lef
 </style></head><body><main>{''.join(body_lines)}<div class="footer">Generated by deep_web_crawl {VERSION}</div></main></body></html>"""
 
 
-def _export(con: sqlite3.Connection, job_id: str, formats: list[str], search_meta: dict[str, Any] | None = None) -> dict[str, str]:
+
+def _export(con: sqlite3.Connection, job_id: str, formats: list[str], search_meta: dict[str, Any] | None = None, export_raw: bool = False) -> dict[str, str]:
     job = con.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
     pages = list(con.execute("SELECT * FROM pages WHERE job_id=? ORDER BY relevance DESC, depth ASC, fetched_at ASC", (job_id,)))
     events = list(con.execute("SELECT * FROM progress_events WHERE job_id=? ORDER BY id ASC", (job_id,)))
@@ -679,12 +779,18 @@ def _export(con: sqlite3.Connection, job_id: str, formats: list[str], search_met
         paths["html"] = str(p)
     if "json" in formats:
         p = REPORT_DIR / f"{stem}.json"
-        p.write_text(_json({"job": dict(job), "pages": [dict(x) for x in pages], "events": [dict(x) for x in events], "search_meta": search_meta or {}}), encoding="utf-8")
+        page_rows = []
+        for row in pages:
+            item = dict(row)
+            if not export_raw:
+                item.pop("text", None)
+                item["text_omitted"] = True
+            page_rows.append(item)
+        p.write_text(_json({"job": dict(job), "pages": page_rows, "events": [dict(x) for x in events], "search_meta": search_meta or {}, "export_raw": export_raw}), encoding="utf-8")
         paths["json"] = str(p)
     con.execute("UPDATE jobs SET markdown_path=?, html_path=?, json_path=? WHERE job_id=?", (paths.get("markdown", ""), paths.get("html", ""), paths.get("json", ""), job_id))
     con.commit()
     return paths
-
 
 def handler(args=None, **_kw):
     if args is None:
@@ -716,10 +822,14 @@ def handler(args=None, **_kw):
     same_domain_only = _bool(args.get("same_domain_only"), False)
     formats = [x for x in _list(args.get("export_formats") or ["markdown", "html"]) if x in {"markdown", "html", "json"}] or ["markdown", "html"]
     include_raw = _bool(args.get("include_raw"), False)
+    export_raw = _bool(args.get("export_raw"), False)
+    allow_private_urls = _bool(args.get("allow_private_urls"), False)
+    allowed_domains = _list(args.get("allowed_domains"))
+    blocked_domains = _list(args.get("blocked_domains"))
     seed_urls = [_clean_url(u) for u in _list(args.get("urls"))]
-    seed_urls = [u for u in seed_urls if u]
+    seed_urls = [u for u in seed_urls if u and _url_allowed_by_policy(u, allow_private_urls=allow_private_urls, allowed_domains=allowed_domains, blocked_domains=blocked_domains)[0]]
     engines = [e for e in _list(args.get("search_engines") or SEARCH_ENGINES) if e in SEARCH_ENGINES] or SEARCH_ENGINES
-    job_id = str(args.get("job_id") or "").strip() or _hash(query + "\n" + "\n".join(seed_urls) + f"\n{preset}\n{int(_now() // 3600)}")[:24]
+    job_id = str(args.get("job_id") or "").strip() or _hash(query + "\n" + "\n".join(seed_urls) + f"\n{preset}")[:24]
 
     con = _db()
     started = _now()
@@ -753,7 +863,7 @@ def handler(args=None, **_kw):
         if url in visited or depth > max_depth:
             continue
         visited.add(url)
-        fetched = _fetch(url, timeout, cache_ttl, force_refresh, con, respect_robots=respect_robots, rate_limit_seconds=rate_limit_seconds)
+        fetched = _fetch(url, timeout, cache_ttl, force_refresh, con, respect_robots=respect_robots, rate_limit_seconds=rate_limit_seconds, allow_private_urls=allow_private_urls, allowed_domains=allowed_domains, blocked_domains=blocked_domains)
         title, text, links = _parse_page(url, fetched.get("body") or "", fetched.get("content_type") or "")
         summary = _summarize(text, query) if text else ""
         relevance, credibility, word_count, duplicate = _store_page(con, job_id, url, depth, fetched, title, text, summary, links, query)
@@ -782,8 +892,8 @@ def handler(args=None, **_kw):
     status = "success" if pages_done >= max_pages else ("partial" if pages_done else "failed")
     con.execute("UPDATE jobs SET status=?, updated_at=?, progress=?, pages_done=?, pages_target=? WHERE job_id=?", (status, _now(), 1.0 if pages_done else 0.0, pages_done, max_pages, job_id))
     con.commit()
-    search_meta = {"engines": discovery_by_engine, "seed_urls": seed_urls, "external_added": external_added, "visited": len(visited), "cache_ttl_seconds": cache_ttl, "respect_robots": respect_robots, "rate_limit_seconds": rate_limit_seconds}
-    paths = _export(con, job_id, formats, search_meta=search_meta)
+    search_meta = {"engines": discovery_by_engine, "seed_urls": seed_urls, "external_added": external_added, "visited": len(visited), "cache_ttl_seconds": cache_ttl, "respect_robots": respect_robots, "rate_limit_seconds": rate_limit_seconds, "allow_private_urls": allow_private_urls, "allowed_domains": allowed_domains, "blocked_domains": blocked_domains}
+    paths = _export(con, job_id, formats, search_meta=search_meta, export_raw=export_raw)
     pages = list(con.execute("SELECT p.url,p.title,p.status,p.depth,p.summary,p.text,p.relevance,p.credibility,p.word_count,p.canonical_url,p.content_hash,p.citations_json FROM pages p WHERE p.job_id=? ORDER BY p.relevance DESC, p.credibility DESC, p.depth ASC, p.fetched_at ASC", (job_id,)))
     events = list(con.execute("SELECT event,detail,done,total,ts FROM progress_events WHERE job_id=? ORDER BY id DESC LIMIT 20", (job_id,)))
     result = {
@@ -813,6 +923,106 @@ def handler(args=None, **_kw):
         result["memory_wiki_task_capsule"] = _memory_capsule(job, pages, paths)
     return _json(result)
 
+
+
+def _job_or_error(con: sqlite3.Connection, job_id: str) -> sqlite3.Row | None:
+    return con.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+
+
+def handle_deep_web_status(args=None, **_kw):
+    args = dict(args or {})
+    job_id = str(args.get("job_id") or "").strip()
+    if not job_id:
+        return _json({"status": "error", "error": "job_id is required"})
+    limit = _int(args.get("limit"), 20, 1, 200)
+    con = _db()
+    job = _job_or_error(con, job_id)
+    if not job:
+        return _json({"status": "error", "error": "job_not_found", "job_id": job_id})
+    events = [dict(x) for x in con.execute("SELECT event,detail,done,total,ts FROM progress_events WHERE job_id=? ORDER BY id DESC LIMIT ?", (job_id, limit))]
+    return _json({"status": "success", "job": dict(job), "progress": _progress_bar(job["pages_done"] or 0, job["pages_target"] or 0), "recent_events": list(reversed(events))})
+
+
+def handle_deep_web_open_report(args=None, **_kw):
+    args = dict(args or {})
+    job_id = str(args.get("job_id") or "").strip()
+    con = _db()
+    job = _job_or_error(con, job_id)
+    if not job:
+        return _json({"status": "error", "error": "job_not_found", "job_id": job_id})
+    return _json({"status": "success", "job_id": job_id, "report_paths": {"markdown": job["markdown_path"], "html": job["html_path"], "json": job["json_path"]}})
+
+
+def handle_deep_web_query_sources(args=None, **_kw):
+    args = dict(args or {})
+    job_id = str(args.get("job_id") or "").strip()
+    query = str(args.get("query") or "").strip().lower()
+    limit = _int(args.get("limit"), 20, 1, 200)
+    con = _db()
+    if not _job_or_error(con, job_id):
+        return _json({"status": "error", "error": "job_not_found", "job_id": job_id})
+    rows = list(con.execute("SELECT url,title,status,depth,summary,relevance,credibility,word_count,canonical_url,citations_json FROM pages WHERE job_id=? ORDER BY relevance DESC, credibility DESC LIMIT ?", (job_id, max(limit * 5, limit))))
+    out = []
+    for row in rows:
+        hay = f"{row['url']} {row['title']} {row['summary']}".lower()
+        if query and query not in hay:
+            continue
+        item = dict(row)
+        try:
+            item["citations"] = json.loads(item.pop("citations_json") or "[]")
+        except Exception:
+            item["citations"] = []
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return _json({"status": "success", "job_id": job_id, "count": len(out), "sources": out})
+
+
+def handle_deep_web_delete_job(args=None, **_kw):
+    args = dict(args or {})
+    job_id = str(args.get("job_id") or "").strip()
+    delete_files = _bool(args.get("delete_files"), False)
+    con = _db()
+    job = _job_or_error(con, job_id)
+    if not job:
+        return _json({"status": "error", "error": "job_not_found", "job_id": job_id})
+    removed_files = []
+    if delete_files:
+        for key in ("markdown_path", "html_path", "json_path"):
+            path = Path(job[key] or "")
+            if path.exists() and path.is_file() and REPORT_DIR in path.parents:
+                path.unlink()
+                removed_files.append(str(path))
+    for table in ("pages", "progress_events", "jobs"):
+        con.execute(f"DELETE FROM {table} WHERE job_id=?", (job_id,))
+    con.commit()
+    return _json({"status": "success", "job_id": job_id, "deleted_files": removed_files})
+
+
+def handle_deep_web_export(args=None, **_kw):
+    args = dict(args or {})
+    job_id = str(args.get("job_id") or "").strip()
+    formats = [x for x in _list(args.get("export_formats") or ["markdown", "html"]) if x in {"markdown", "html", "json"}] or ["markdown", "html"]
+    con = _db()
+    if not _job_or_error(con, job_id):
+        return _json({"status": "error", "error": "job_not_found", "job_id": job_id})
+    paths = _export(con, job_id, formats, export_raw=_bool(args.get("export_raw"), False))
+    return _json({"status": "success", "job_id": job_id, "report_paths": paths})
+
+
+def handle_deep_web_resume(args=None, **_kw):
+    args = dict(args or {})
+    job_id = str(args.get("job_id") or "").strip()
+    con = _db()
+    job = _job_or_error(con, job_id)
+    if not job:
+        return _json({"status": "error", "error": "job_not_found", "job_id": job_id})
+    rerun = {"query": job["query"], "preset": job["preset"], "job_id": job_id, "force_refresh": _bool(args.get("force_refresh"), False)}
+    if int(args.get("max_pages") or 0) > 0:
+        rerun["max_pages"] = int(args.get("max_pages"))
+    if int(args.get("max_depth") or -1) >= 0:
+        rerun["max_depth"] = int(args.get("max_depth"))
+    return handler(rerun)
 
 def register(ctx):
     ctx.register_tool(name="deep_web_crawl", toolset="hermes_omnicouncil", schema=SCHEMA, handler=handler)

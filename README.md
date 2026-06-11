@@ -1,16 +1,16 @@
-# Hermes OmniCouncil v5.1.1
+# Hermes OmniCouncil v5.2.0
 
-Multi-model agentic council plugin for Hermes Agent: shared blackboard, message rounds, safe read-only tool brokering, swappable model presets, and a companion `deep_web_crawl` research crawler.
+Multi-model agentic council plugin for Hermes Agent: structured blackboard, voting/consensus, message rounds, dry-run budget estimates, model failover, safe read-only tool brokering, doctor/cache tools, and a companion `deep_web_crawl` research crawler with management tools.
 
 ## What it gives you
 
-- **Agentic blackboard** — agents share facts, assumptions, objections, open questions, and verification notes.
+- **Structured agentic blackboard** — agents emit `BLACKBOARD_UPDATE_JSON`; the orchestrator merges facts, assumptions, objections, open questions, actions, and evidence refs.
 - **Message rounds** — directed agent-to-agent messages: questions, challenges, clarifications, evidence shares.
 - **Multi-model routing** — presets for `deepseek`, `gpt55`, and `mixed`; explicit `member_models`, `judge_model`, and `research_model` overrides.
 - **DeepSeek-first default** — `model_preset=deepseek` and `deepseek-v4-pro` by default, matching local Hermes DeepSeek proxy deployments.
 - **Safe brokered tools** — agents may request read-only tools; the orchestrator executes only allowlisted tools and injects bounded/redacted previews.
 - **Research mode** — optional research subagents plus `web_research_brief` and standalone `deep_web_crawl`.
-- **Judge controls** — `decision_policy`, `red_team`, `dissent_required`, `anti_slop`, and optional `self_review_round`.
+- **Judge/voting controls** — `decision_policy`, structured `VOTE_JSON`, `red_team`, `dissent_required`, `anti_slop`, `strict_json` + optional `json_schema`, and optional `self_review_round`.
 - **Large-context defaults** — 384k output-token ceilings for member and judge calls when the provider supports it.
 
 ## Repository contents
@@ -19,7 +19,7 @@ Multi-model agentic council plugin for Hermes Agent: shared blackboard, message 
 |---|---|
 | `__init__.py` | Main Hermes tool plugin: schema, model routing, blackboard orchestration, brokered safe tools, judge synthesis. |
 | `deep_web_research.py` | Companion `deep_web_crawl` tool: multi-engine discovery, crawling, SQLite source DB, Markdown/HTML/JSON reports. |
-| `plugin.yaml` | Hermes plugin manifest exposing `hermes_omnicouncil` and `deep_web_crawl`. |
+| `plugin.yaml` | Hermes plugin manifest exposing `hermes_omnicouncil`, doctor/cache tools, `deep_web_crawl`, and deep-web management tools. |
 | `scripts/smoke_test.py` | Import/registration/model-routing/tool-request smoke test with fake model calls. |
 
 ## Installation
@@ -42,6 +42,16 @@ plugins:
 ```
 
 Restart Hermes after installing or updating the plugin so the tool registry reloads.
+
+
+## v5.2 additions
+
+- `dry_run=true` returns model-call/token/latency estimate without model calls.
+- `fallback_models=[...]` retries failed model calls through a fallback chain.
+- Agents can emit `BLACKBOARD_UPDATE_JSON` and `VOTE_JSON`; the result includes merged blackboard state and vote summary.
+- `save_task_capsule=true` now calls `memory_wiki_add_task_capsule` through the orchestrator runtime.
+- New tools: `omnicouncil_doctor`, `omnicouncil_cache_list/get/clear/explain_key`.
+- `deep_web_crawl` now blocks private/local URLs by default, separates `include_raw` from `export_raw`, uses deterministic empty `job_id`, and exposes `deep_web_status/open_report/query_sources/delete_job/export/resume`.
 
 ## Model routing
 
@@ -189,7 +199,7 @@ python3 scripts/smoke_test.py
 Expected smoke output:
 
 ```text
-hermes-omnicouncil v5.1.1 smoke ok: tools=2 calls=13 member_models=4 messages_rounds=1
+hermes-omnicouncil v5.2.0 smoke ok: tools>=13 calls=13 member_models=4 messages_rounds=1
 ```
 
 ## Migration from `gpt55-consilium`
@@ -218,4 +228,4 @@ Key changes:
 
 ## Version
 
-`5.1.1-omni-blackboard-deepseek-default`
+`5.2.0-agentic-blackboard-tools-cache-crawler`
