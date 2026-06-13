@@ -1,6 +1,6 @@
 # Hermes OmniCouncil v5.2.0
 
-Multi-model agentic council plugin for Hermes Agent: structured blackboard, voting/consensus, message rounds, dry-run budget estimates, model failover, safe read-only tool brokering, doctor/cache tools, and a companion `deep_web_crawl` research crawler with management tools.
+Hermes Agent multi-model OmniCouncil plugin: agentic blackboard, voting, model failover, safe brokered tools, doctor/cache tools, and deep-web research crawler. Includes message rounds, dry-run budget estimates, cache/doctor surfaces, and managed `deep_web_crawl` reports.
 
 ## What it gives you
 
