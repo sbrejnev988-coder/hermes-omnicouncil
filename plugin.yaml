@@ -1,6 +1,6 @@
 name: hermes-omnicouncil
-version: 5.2.0
-description: "Hermes OmniCouncil v5.2.0 — multi-model agentic council with structured blackboard, voting/consensus, dry-run budget estimates, model failover, doctor/cache tools, safe brokered tools, and deep_web_crawl management."
+version: 5.3.0
+description: "Hermes OmniCouncil v5.3.0 — DeepSeek-first agentic council with structured evidence ledger, Plan→Probe→Decide preflight, prosecutor audit, forced dissent policy, compact lesson extraction, judge compiler, safe brokered tools, doctor/cache tools, and deep_web_crawl management."
 tools:
   - hermes_omnicouncil
   - omnicouncil_doctor

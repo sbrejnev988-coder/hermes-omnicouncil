@@ -1,29 +1,33 @@
-# Python
+# Python/runtime artifacts
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyo
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 
-# Local/runtime artifacts
-.cache/
+# Hermes/local runtime state
 .env
-*.env
-*.log
+.env.*
+*.db
 *.sqlite
 *.sqlite3
-*.db
-*.db-*
-
-# Backups and generated reports
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+logs/
+backups/
+snapshots/
+spool/
+sessions/
+cache/
+reports/
 *.bak
 *.bak-*
-*.bak_*
-backups/
-.patch_backups/
-reports/
-exports/
+*.tmp
 
 # OS/editor
 .DS_Store

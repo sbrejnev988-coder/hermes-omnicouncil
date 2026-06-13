@@ -1,4 +1,4 @@
-"""hermes-omnicouncil v5.2.0 — multi-model agentic council with blackboard + message rounds.
+"""hermes-omnicouncil v5.3.0 — multi-model agentic council with evidence/probe/prosecutor/compiler loops.
 
 Features:
 - Swappable models (model/member_models/judge_model/model_preset)
@@ -6,7 +6,7 @@ Features:
 - Safe agent tools: memory (query/pack), file read/search, web_search, web_extract, web_research_brief
 - NO patch/write significant tools for agents (read-only safety)
 - Presets (fast/balanced/deep/audit/max/omni_blackboard/ultra)
-- Evidence ledger, tool-request protocol, collaboration rounds, judge synthesis
+- Structured evidence ledger, Plan→Probe→Decide, prosecutor audit, forced dissent, judge compiler
 - deep_web_crawl for professional research reports
 """
 from __future__ import annotations
@@ -106,7 +106,7 @@ _deep_spec.loader.exec_module(_deep_web_research)
 # ═══════════════════════════════════════════════════════════════════════
 DEFAULT_MODEL = "deepseek-v4-pro"
 REASONING_EFFORT = "high"
-VERSION = "5.2.0-agentic-tools-deepseek-default"
+VERSION = "5.3.0-evidence-probe-prosecutor-compiler"
 
 MODEL_PRESETS = {
     "deepseek": {
@@ -291,10 +291,10 @@ STATIC_TOOLSETS = {
 SCHEMA = {
     "name": "hermes_omnicouncil",
     "description": (
-        "Hermes OmniCouncil v5.2.0: multi-model agentic council with shared blackboard, message rounds, "
+        "Hermes OmniCouncil v5.3.0: multi-model agentic council with shared blackboard, message rounds, "
         "safe memory/web/file tools, swappable models, web_research_brief, and deep_web_crawl. "
         "Agents collaborate via blackboard notes, peer review, and directed messages. "
-        "judge synthesises the final result."
+        "Adds Evidence Ledger, Plan→Probe→Decide, Prosecutor, forced dissent, lesson extraction, and Judge-as-Compiler."
     ),
     "parameters": {
         "type": "object",
@@ -363,6 +363,11 @@ SCHEMA = {
             "dissent_required": {"type": "boolean", "default": False, "description": "Судья обязан перечислить dissent/objections даже при консенсусе."},
             "anti_slop": {"type": "boolean", "default": False, "description": "Каждая рекомендация должна иметь file:line/concrete detail."},
             "self_review_round": {"type": "boolean", "default": False, "description": "Post-judge self-review round для проверки unsupported claims."},
+            "plan_probe_decide": {"type": "boolean", "default": True, "description": "Enable Plan→Probe→Decide preflight: model plans unknowns, broker executes safe evidence probes, then members decide."},
+            "prosecutor_round": {"type": "boolean", "default": True, "description": "Run an adversarial prosecutor after judge synthesis to flag unsupported claims, contradictions and overconfidence."},
+            "minimum_objections": {"type": "integer", "default": 2, "description": "Minimum objections when dissent_required=true; forced dissent generates missing objections before judge."},
+            "compiler_judge": {"type": "boolean", "default": True, "description": "Require judge to compile a canonical JUDGE_COMPILED_JSON object; result also exposes compiled_synthesis."},
+            "save_council_lessons": {"type": "boolean", "default": False, "description": "Persist compact lessons/anti-regression claims to memory_wiki; raw transcripts are never saved."},
         },
         "required": ["task"],
     },
@@ -901,6 +906,432 @@ def _evidence_text(ledger: list[dict[str, Any]]) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  Evidence ledger / Plan-Probe-Decide / Prosecutor / Compiler
+# ═══════════════════════════════════════════════════════════════
+CLAIM_STATUSES = {"supported", "unsupported", "assumption", "refuted", "uncertain"}
+
+
+def _claim_count(ledger: list[dict[str, Any]]) -> int:
+    return sum(1 for item in ledger if isinstance(item, dict) and item.get("kind") == "claim")
+
+
+def _add_claim(
+    ledger: list[dict[str, Any]],
+    source: str,
+    claim: str,
+    claim_type: str = "finding",
+    evidence_refs: list[str] | None = None,
+    confidence: float | int | str = 0.5,
+    status: str = "",
+) -> str:
+    claim_text = _truncate_text(claim, 1200).strip()
+    if not claim_text:
+        return ""
+    evidence_refs = [str(x).strip() for x in (evidence_refs or []) if str(x).strip()][:20]
+    try:
+        conf = max(0.0, min(1.0, float(confidence)))
+    except Exception:
+        conf = 0.5
+    normalized_status = str(status or "").lower().strip()
+    if normalized_status not in CLAIM_STATUSES:
+        normalized_status = "supported" if evidence_refs else "unsupported"
+    duplicate_key = (claim_text.lower(), str(source or "").lower())
+    for item in ledger:
+        if item.get("kind") == "claim" and (str(item.get("claim", "")).lower(), str(item.get("source", "")).lower()) == duplicate_key:
+            return str(item.get("id") or "")
+    cid = f"C{_claim_count(ledger) + 1}"
+    ledger.append({
+        "id": cid,
+        "kind": "claim",
+        "source": _truncate_text(source, 200),
+        "claim": claim_text,
+        "type": _truncate_text(claim_type or "finding", 120),
+        "evidence_refs": evidence_refs,
+        "confidence": round(conf, 3),
+        "status": normalized_status,
+    })
+    return cid
+
+
+def _extract_claims(text: str, source: str = "agent") -> list[dict[str, Any]]:
+    if not text:
+        return []
+    candidates: list[str] = []
+    raw = _json_array_after_marker(text, "CLAIMS_JSON")
+    if raw:
+        candidates.append(raw)
+    # Some models return a raw fenced list without the marker.
+    for fence in re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE):
+        stripped = fence.strip()
+        if stripped.startswith("[") and "claim" in stripped.lower():
+            candidates.append(stripped)
+    out: list[dict[str, Any]] = []
+    for candidate in candidates:
+        try:
+            data = _safe_json_loads(candidate)
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            data = data.get("claims") or []
+        if not isinstance(data, list):
+            continue
+        for item in data[:40]:
+            if not isinstance(item, dict):
+                continue
+            claim = str(item.get("claim") or item.get("text") or "").strip()
+            if not claim:
+                continue
+            out.append({
+                "source": source,
+                "claim": claim,
+                "type": str(item.get("type") or item.get("claim_type") or "finding"),
+                "evidence_refs": _as_str_list(item.get("evidence_refs") or item.get("evidence") or item.get("refs")),
+                "confidence": item.get("confidence", 0.5),
+                "status": str(item.get("status") or ""),
+            })
+        if out:
+            break
+    return out
+
+
+def _collect_claims_from_responses(responses: list[dict[str, Any]], ledger: list[dict[str, Any]]) -> list[str]:
+    added: list[str] = []
+    for item in responses or []:
+        if not isinstance(item, dict) or item.get("status") != "success":
+            continue
+        source = str(item.get("label") or item.get("mission") or "agent")
+        text = str(item.get("answer") or item.get("response") or item.get("report") or "")
+        for claim in _extract_claims(text, source):
+            cid = _add_claim(
+                ledger,
+                claim.get("source", source),
+                claim.get("claim", ""),
+                claim.get("type", "finding"),
+                claim.get("evidence_refs") or [],
+                claim.get("confidence", 0.5),
+                claim.get("status", ""),
+            )
+            if cid:
+                added.append(cid)
+    if added:
+        _add_evidence(ledger, "claims_ledger", f"Registered {len(added)} structured agent claims.", claim_ids=added[:80])
+    return added
+
+
+def _claims_summary(ledger: list[dict[str, Any]]) -> dict[str, Any]:
+    claims = [item for item in ledger if isinstance(item, dict) and item.get("kind") == "claim"]
+    by_status: dict[str, int] = {}
+    for claim in claims:
+        status = str(claim.get("status") or "uncertain")
+        by_status[status] = by_status.get(status, 0) + 1
+    return {
+        "total": len(claims),
+        "by_status": by_status,
+        "supported": [c for c in claims if c.get("status") == "supported"][:30],
+        "unsupported": [c for c in claims if c.get("status") != "supported"][:30],
+    }
+
+
+def _normalise_tool_request_item(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    tool = _truncate_text(item.get("tool", ""), 120).strip()
+    if not tool or tool not in SAFE_AGENT_TOOLS:
+        return None
+    mutating = _normalise_bool(item.get("mutating"), False)
+    if mutating or tool in ("patch", "write_file", "terminal", "process", "cronjob"):
+        return None
+    return {
+        "tool": tool,
+        "args": item.get("args", {}) if isinstance(item.get("args", {}), dict) else {},
+        "reason": _truncate_text(item.get("reason", ""), 500),
+        "priority": _clamp_int(item.get("priority"), 3, 1, 5),
+        "expected_information_gain": _truncate_text(item.get("expected_information_gain", ""), 500),
+        "mutating": False,
+        "requires_lock": _as_str_list(item.get("requires_lock")),
+    }
+
+
+def _extract_probe_plan(text: str) -> dict[str, Any]:
+    if not text:
+        return {"unknowns": [], "tool_requests": [], "risk_points": [], "expected_evidence": [], "raw": ""}
+    raw = _json_value_after_marker(text, "PROBE_PLAN_JSON", "{")
+    if not raw and text.strip().startswith("{"):
+        raw = text.strip()
+    data: dict[str, Any] = {}
+    if raw:
+        try:
+            parsed = _safe_json_loads(raw)
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:
+            data = {}
+    if not data:
+        data = {"raw": _truncate_text(text, 4000)}
+    reqs = []
+    for item in data.get("tool_requests", []) or []:
+        cleaned = _normalise_tool_request_item(item)
+        if cleaned:
+            reqs.append(cleaned)
+    if not reqs:
+        reqs = _extract_tool_requests(text, 20)
+    return {
+        "unknowns": [_truncate_text(x, 800) for x in _as_str_list(data.get("unknowns"))[:30]],
+        "risk_points": [_truncate_text(x, 800) for x in _as_str_list(data.get("risk_points"))[:30]],
+        "expected_evidence": [_truncate_text(x, 800) for x in _as_str_list(data.get("expected_evidence"))[:30]],
+        "tool_requests": reqs,
+        "raw": _truncate_text(data.get("raw", ""), 4000) if data.get("raw") else "",
+    }
+
+
+def _run_probe_phase(
+    task: str,
+    context: str,
+    mode: str,
+    manifest: dict[str, Any],
+    ledger: list[dict[str, Any]],
+    max_tool_requests: int,
+    model: str,
+    timeout: int,
+    retries: int,
+    jitter_ms: int,
+    max_workers: int,
+) -> dict[str, Any]:
+    prompt = f"""Ты preflight planner Hermes OmniCouncil. Реализуй фазу Plan→Probe→Decide.
+Твоя задача — НЕ решать задачу, а перечислить неизвестные, самые ценные read-only проверки и ожидаемые evidence.
+
+Верни JSON object после маркера PROBE_PLAN_JSON:
+{{
+  "unknowns": ["что неизвестно"],
+  "tool_requests": [{{"tool":"read_file|search_files|web_search|web_extract|memory_wiki_query|memory_wiki_pack_context|skill_view|skills_list", "args":{{}}, "reason":"...", "priority":1, "expected_information_gain":"...", "mutating":false}}],
+  "risk_points": ["главные риски"],
+  "expected_evidence": ["какой факт нужен для решения"]
+}}
+
+Запрещено просить mutating tools. Tool policy: {manifest.get('tool_mode')}.
+Режим: {mode}
+Задача: {task}
+Контекст:
+{_bounded_context(context)}
+"""
+    try:
+        raw = _call_model_text(prompt, min(16000, DEFAULT_MAX_TOKENS), 0.0, model=model, timeout=timeout, retries=retries, jitter_ms=jitter_ms)
+        plan = _extract_probe_plan(raw)
+        requests = plan.get("tool_requests", [])[:max(0, min(max_tool_requests, 20))]
+        if requests and manifest.get("tool_mode") != "off":
+            _execute_tool_requests(requests, ledger, max_workers=max_workers)
+        plan["tool_requests"] = requests
+        plan["executed"] = sum(1 for req in requests if req.get("executed"))
+        _add_evidence(ledger, "plan_probe_decide", "Completed Plan→Probe→Decide preflight.", unknowns=len(plan.get("unknowns", [])), tool_requests=len(requests), executed=plan["executed"])
+        return plan
+    except Exception as exc:
+        _add_evidence(ledger, "plan_probe_decide", "Plan→Probe→Decide preflight failed; continuing without probe evidence.", error=_truncate_text(str(exc), 800))
+        return {"status": "failed", "error": _truncate_text(str(exc), 800), "unknowns": [], "tool_requests": [], "risk_points": [], "expected_evidence": []}
+
+
+def _ensure_minimum_dissent(
+    task: str,
+    context: str,
+    responses: list[dict[str, Any]],
+    votes_summary: dict[str, Any],
+    ledger: list[dict[str, Any]],
+    minimum_objections: int,
+    model: str,
+    timeout: int,
+    retries: int,
+    jitter_ms: int,
+) -> dict[str, Any]:
+    existing = votes_summary.get("blocking_objections", []) if isinstance(votes_summary, dict) else []
+    need = max(0, int(minimum_objections or 0) - len(existing))
+    if need <= 0:
+        return {"required": minimum_objections, "existing": len(existing), "generated": []}
+    prompt = f"""Ты forced-dissent reviewer Hermes OmniCouncil.
+Consensus without dissent is forbidden for this run. Generate {need} strongest objections/failure modes that the judge must address.
+
+Return only:
+FORCED_DISSENT_JSON: [{{"objection":"...", "why_it_matters":"...", "falsification_test":"...", "confidence":0.0}}]
+
+Задача: {task}
+Контекст:
+{_bounded_context(context)}
+
+Responses/votes snapshot:
+{_truncate_text(_json({"votes": votes_summary, "responses": [_format_answer(r, max_chars=1600) for r in responses[:20]]}), 40000)}
+"""
+    try:
+        raw = _call_model_text(prompt, min(24000, DEFAULT_MAX_TOKENS), 0.05, model=model, timeout=timeout, retries=retries, jitter_ms=jitter_ms)
+        arr = _json_array_after_marker(raw, "FORCED_DISSENT_JSON")
+        generated: list[dict[str, Any]] = []
+        if arr:
+            try:
+                data = _safe_json_loads(arr)
+                if isinstance(data, list):
+                    for item in data[:need]:
+                        if isinstance(item, dict) and item.get("objection"):
+                            generated.append({
+                                "from": "forced_dissent",
+                                "objection": _truncate_text(item.get("objection"), 800),
+                                "why_it_matters": _truncate_text(item.get("why_it_matters", ""), 800),
+                                "falsification_test": _truncate_text(item.get("falsification_test", ""), 800),
+                                "confidence": item.get("confidence", 0.5),
+                            })
+            except Exception:
+                generated = []
+        if generated:
+            votes_summary.setdefault("blocking_objections", []).extend(generated)
+            _add_evidence(ledger, "forced_dissent", f"Generated {len(generated)} forced dissent objections.", objections=generated)
+        return {"required": minimum_objections, "existing": len(existing), "generated": generated, "raw": _truncate_text(raw, 4000) if not generated else ""}
+    except Exception as exc:
+        return {"required": minimum_objections, "existing": len(existing), "generated": [], "error": _truncate_text(str(exc), 800)}
+
+
+def _run_prosecutor(
+    task: str,
+    context: str,
+    synthesis: str,
+    ledger: list[dict[str, Any]],
+    votes_summary: dict[str, Any],
+    model: str,
+    timeout: int,
+    retries: int,
+    jitter_ms: int,
+) -> dict[str, Any]:
+    prompt = f"""Ты adversarial prosecutor Hermes OmniCouncil.
+Проверь judge synthesis и верни только JSON после PROSECUTOR_JSON.
+Ищи: неподтверждённые claims, противоречия, overconfidence, проигнорированный dissent, обязательные проверки перед применением.
+
+PROSECUTOR_JSON: {{
+  "verdict":"pass|revise|fail",
+  "unsupported_claims":[],
+  "contradictions":[],
+  "overconfident_claims":[],
+  "ignored_dissent":[],
+  "must_verify_before_final":[],
+  "confidence":0.0
+}}
+
+Задача: {task}
+Контекст:
+{_bounded_context(context)}
+
+Judge synthesis:
+{_truncate_text(synthesis, 80000)}
+
+Evidence ledger / claims:
+{_evidence_text(ledger)}
+
+Votes:
+{_truncate_text(_json(votes_summary), 12000)}
+"""
+    try:
+        raw = _call_model_text(prompt, min(32000, DEFAULT_MAX_TOKENS), 0.0, model=model, timeout=timeout, retries=retries, jitter_ms=jitter_ms)
+        obj = _json_value_after_marker(raw, "PROSECUTOR_JSON", "{")
+        data: dict[str, Any] = {}
+        if obj:
+            try:
+                parsed = _safe_json_loads(obj)
+                if isinstance(parsed, dict):
+                    data = parsed
+            except Exception:
+                data = {}
+        if not data:
+            data = {"verdict": "unparsed", "raw": _truncate_text(raw, 6000), "unsupported_claims": [], "contradictions": [], "overconfident_claims": [], "ignored_dissent": [], "must_verify_before_final": []}
+        data["unsupported_claims"] = [_truncate_text(x, 1000) for x in _as_str_list(data.get("unsupported_claims"))[:40]]
+        data["contradictions"] = [_truncate_text(x, 1000) for x in _as_str_list(data.get("contradictions"))[:40]]
+        data["overconfident_claims"] = [_truncate_text(x, 1000) for x in _as_str_list(data.get("overconfident_claims"))[:40]]
+        data["ignored_dissent"] = [_truncate_text(x, 1000) for x in _as_str_list(data.get("ignored_dissent"))[:40]]
+        data["must_verify_before_final"] = [_truncate_text(x, 1000) for x in _as_str_list(data.get("must_verify_before_final"))[:40]]
+        _add_evidence(ledger, "prosecutor", "Ran adversarial prosecutor audit.", verdict=data.get("verdict"), unsupported=len(data.get("unsupported_claims", [])), contradictions=len(data.get("contradictions", [])))
+        return data
+    except Exception as exc:
+        return {"verdict": "error", "error": _truncate_text(str(exc), 800), "unsupported_claims": [], "contradictions": [], "overconfident_claims": [], "ignored_dissent": [], "must_verify_before_final": []}
+
+
+def _compile_judge_output(synthesis: str, ledger: list[dict[str, Any]], votes_summary: dict[str, Any], prosecutor_report: dict[str, Any] | None = None) -> dict[str, Any]:
+    data: dict[str, Any] = {}
+    raw = _json_value_after_marker(synthesis or "", "JUDGE_COMPILED_JSON", "{")
+    if raw:
+        try:
+            parsed = _safe_json_loads(raw)
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:
+            data = {}
+    if not data:
+        stripped = (synthesis or "").strip()
+        if stripped.startswith("{"):
+            try:
+                parsed = _safe_json_loads(stripped)
+                if isinstance(parsed, dict):
+                    data = parsed
+            except Exception:
+                data = {}
+    claims = _claims_summary(ledger)
+    prosecutor_report = prosecutor_report or {}
+    compiled = {
+        "verdict": _truncate_text(data.get("verdict") or data.get("decision") or "synthesised", 200),
+        "confirmed_findings": data.get("confirmed_findings") if isinstance(data.get("confirmed_findings"), list) else claims.get("supported", []),
+        "unsupported_claims": data.get("unsupported_claims") if isinstance(data.get("unsupported_claims"), list) else claims.get("unsupported", []),
+        "rejected_claims": data.get("rejected_claims") if isinstance(data.get("rejected_claims"), list) else [],
+        "decision": _truncate_text(data.get("decision") or data.get("summary") or "", 2000),
+        "implementation_plan": data.get("implementation_plan") if isinstance(data.get("implementation_plan"), list) else data.get("implementation_plan", []),
+        "tests": data.get("tests") if isinstance(data.get("tests"), list) else [],
+        "risks": data.get("risks") if isinstance(data.get("risks"), list) else [],
+        "dissent": data.get("dissent") if isinstance(data.get("dissent"), list) else (votes_summary or {}).get("blocking_objections", []),
+        "next_step": _truncate_text(data.get("next_step") or "", 1000),
+        "prosecutor": prosecutor_report,
+        "claim_counts": claims.get("by_status", {}),
+    }
+    return _tool_result_preview(compiled, 40000)
+
+
+def _derive_council_lessons(task: str, status: str, compiled: dict[str, Any], prosecutor_report: dict[str, Any], diagnostics: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    lessons: list[dict[str, Any]] = []
+    diagnostics = diagnostics or {}
+    unsupported = _as_str_list((prosecutor_report or {}).get("unsupported_claims"))
+    contradictions = _as_str_list((prosecutor_report or {}).get("contradictions"))
+    if unsupported:
+        lessons.append({
+            "type": "anti_hallucination",
+            "lesson": "OmniCouncil produced or preserved unsupported claims; require evidence IDs before judge confirmation.",
+            "trigger": _truncate_text(unsupported[0], 600),
+            "prevention": "Use Plan→Probe→Decide and keep unsupported claims in compiled_synthesis.unsupported_claims.",
+        })
+    if contradictions:
+        lessons.append({
+            "type": "contradiction",
+            "lesson": "Agents disagreed on a material point; judge must resolve or list the contradiction explicitly.",
+            "trigger": _truncate_text(contradictions[0], 600),
+            "prevention": "Run prosecutor and forced dissent before final synthesis.",
+        })
+    if status != "success":
+        lessons.append({
+            "type": "degraded_run",
+            "lesson": "Council run degraded; preserve fallback reason and avoid treating fallback synthesis as consensus.",
+            "trigger": _truncate_text(str(diagnostics.get("warnings") or status), 600),
+            "prevention": "Surface judge/model errors in diagnostics and rerun with smaller preset or fallback model if needed.",
+        })
+    return lessons[:10]
+
+
+def _persist_council_lessons(task: str, lessons: list[dict[str, Any]], result: dict[str, Any]) -> dict[str, Any]:
+    saved: list[dict[str, Any]] = []
+    for lesson in lessons[:10]:
+        claim = f"OmniCouncil lesson: {lesson.get('lesson')} Prevention: {lesson.get('prevention')}"
+        payload = {
+            "claim": _truncate_text(claim, 1600),
+            "topic": "hermes_omnicouncil_lessons",
+            "evidence": _truncate_text(_json({"task": task, "trigger": lesson.get("trigger"), "run_status": result.get("status")}), 2000),
+            "source": "hermes_omnicouncil",
+            "confidence": 0.72,
+            "salience": 0.58,
+        }
+        raw = _call_runtime_tool("memory_wiki_add_claim", payload)
+        saved.append(_tool_result_preview(raw, 1200))
+    return {"saved": len(saved), "results": saved}
+
+
+# ═══════════════════════════════════════════════════════════════
 #  Memory prefetch
 # ═══════════════════════════════════════════════════════════════
 def _prefetch_memory_context(task: str, context: str, max_chars: int, ledger: list[dict[str, Any]]) -> str:
@@ -1061,13 +1492,13 @@ Message board (сообщения, адресованные тебе или вс
 
 Tool request protocol:
 - Для запроса фактов используй блок TOOL_REQUESTS_JSON: с JSON-массивом до {max_tool_requests} запросов.
-- Каждый запрос: {{"tool":"memory_wiki_query|read_file|web_search|web_extract|...", "args":{{}}, "reason":"...", "priority":1-5}}
+- Каждый запрос: {{"tool":"memory_wiki_query|read_file|web_search|web_extract|...", "args":{{}}, "reason":"...", "priority":1-5, "expected_information_gain":"...", "mutating":false}}
 - Ты не вызываешь tools напрямую, но можешь запросить их выполнение.
 """
     else:
         capability_block = "\nTool request protocol: disabled for this run. Do not emit TOOL_REQUESTS_JSON.\n"
 
-    return f"""Ты участник {council_i + 1}/{councils} OmniCouncil (Hermes OmniCouncil v5.2).
+    return f"""Ты участник {council_i + 1}/{councils} OmniCouncil (Hermes OmniCouncil v5.3).
 Модель: {member_model}
 Перспектива: {perspective}
 Режим: {mode}
@@ -1079,6 +1510,7 @@ Decision policy: {decision_policy}
 - Если tools включены — запрашивай только safe read-only факты; если выключены — не запрашивай tools.
 - При agentic blackboard режиме добавляй BLACKBOARD_UPDATE_JSON.
 - Всегда добавляй VOTE_JSON для consensus/voting engine.
+- Всегда добавляй CLAIMS_JSON: [{{"claim":"...","type":"fact|risk|decision|assumption","evidence_refs":["E1"],"confidence":0.0,"status":"supported|unsupported|assumption"}}].
 - Ты можешь общаться с другими агентами через Messages: секцию.
 - После ответа других агентов укажи, изменилось ли твоё мнение.
 - Сохраняй возможность для главного ассистента сразу выполнить правки.
@@ -1483,7 +1915,7 @@ Aggregated tool requests:
 - улучши общий план;
 {tool_instruction}
 - общайся с другими агентами через Messages: секцию;
-- добавь BLACKBOARD_UPDATE_JSON и VOTE_JSON.
+- добавь BLACKBOARD_UPDATE_JSON, VOTE_JSON и CLAIMS_JSON.
 - закончи блоками Blackboard update: и Мой обновлённый вклад:.
 
 Safe tools: {"enabled" if tools_enabled else "disabled"}.
@@ -1703,6 +2135,7 @@ def _judge_prompt(
     judge_model: str = DEFAULT_MODEL,
     dissent_required: bool = False,
     anti_slop: bool = False,
+    compiler_judge: bool = True,
 ) -> str:
     blackboard_enabled = bool((manifest.get("blackboard") or {}).get("enabled"))
     discussion = "\n\n".join(
@@ -1743,8 +2176,16 @@ def _judge_prompt(
         'Избегай общих фраз вроде "ensure security" или "add tests" без конкретики.'
         if anti_slop else ""
     )
+    compiler_block = (
+        "JUDGE_AS_COMPILER: сначала скомпилируй канонический блок JUDGE_COMPILED_JSON: "
+        "{\"verdict\":\"...\",\"confirmed_findings\":[],\"unsupported_claims\":[],"
+        "\"rejected_claims\":[],\"decision\":\"...\",\"implementation_plan\":[],"
+        "\"tests\":[],\"risks\":[],\"dissent\":[],\"next_step\":\"...\"}. "
+        "Confirmed findings must cite evidence/claim ids; unsupported claims stay unsupported. "
+        if compiler_judge else ""
+    )
 
-    prompt = f"""Ты финальный судья Hermes OmniCouncil v5.1 (модель: {judge_model}).
+    prompt = f"""Ты финальный судья Hermes OmniCouncil v5.3 (модель: {judge_model}).
 Синтезируй лучший проверяемый результат, опираясь на evidence и research.
 
 Output format: {output_format}
@@ -1753,6 +2194,7 @@ Decision policy: {decision_policy}
 {decision_rule}
 {dissent_block}
 {anti_slop_block}
+{compiler_block}
 
 Задача:
 {task}
@@ -1804,8 +2246,9 @@ def _judge(
     judge_model: str = DEFAULT_MODEL,
     dissent_required: bool = False,
     anti_slop: bool = False,
+    compiler_judge: bool = True,
 ) -> str:
-    prompt = _judge_prompt(task, context, mode, answers, transcript, manifest, ledger, research_reports, tool_requests, messages, output_format, save_task_capsule, decision_policy, red_team, judge_model=judge_model, dissent_required=dissent_required, anti_slop=anti_slop)
+    prompt = _judge_prompt(task, context, mode, answers, transcript, manifest, ledger, research_reports, tool_requests, messages, output_format, save_task_capsule, decision_policy, red_team, judge_model=judge_model, dissent_required=dissent_required, anti_slop=anti_slop, compiler_judge=compiler_judge)
     if strict_json and output_format == "json":
         prompt += "\n\nSTRICT_JSON: Return only valid JSON, no markdown fences."
     try:
@@ -1868,9 +2311,9 @@ def _make_research_missions(task: str, mode: str, manifest: dict[str, Any], max_
 
 def _run_research_mission(mission: dict[str, Any], manifest: dict[str, Any], max_tokens: int, jitter_ms: int = DEFAULT_REQUEST_JITTER_MS, research_model: str = DEFAULT_MODEL) -> dict[str, Any]:
     try:
-        prompt = f"""Ты research subagent в Hermes OmniCouncil v5.1.
+        prompt = f"""Ты research subagent в Hermes OmniCouncil v5.3.
 Используй safe tools (web_search, web_extract, read_file, memory_wiki_query) для поиска фактов.
-Отделяй Evidence от Assumption. Верни Findings, Risks, Acceptance tests.
+Отделяй Evidence от Assumption. Верни Findings, Risks, Acceptance tests. Добавь CLAIMS_JSON с evidence_refs/status/confidence.
 
 Mission: {_json(mission)}
 Capability manifest: {_manifest_text(manifest)}
@@ -2005,19 +2448,22 @@ def _apply_preset_defaults(args: dict[str, Any]) -> dict[str, Any]:
 
 
 
-def _estimate_budget(args: dict[str, Any], total_members: int, collaboration_rounds: int, message_rounds: int, research_missions: bool, max_research_agents: int, self_review_round: bool) -> dict[str, Any]:
+def _estimate_budget(args: dict[str, Any], total_members: int, collaboration_rounds: int, message_rounds: int, research_missions: bool, max_research_agents: int, self_review_round: bool, plan_probe_decide: bool = False, prosecutor_round: bool = False, dissent_required: bool = False) -> dict[str, Any]:
+    probe_calls = 1 if plan_probe_decide else 0
     research_calls = max_research_agents if research_missions else 0
     primary_calls = total_members
     collaboration_calls = total_members * max(0, collaboration_rounds)
     message_calls = total_members * max(0, message_rounds)
     judge_calls = 1 + (1 if self_review_round else 0)
-    total_calls = primary_calls + collaboration_calls + message_calls + research_calls + judge_calls
+    prosecutor_calls = 1 if prosecutor_round else 0
+    dissent_calls = 1 if dissent_required else 0
+    total_calls = probe_calls + primary_calls + collaboration_calls + message_calls + research_calls + judge_calls + prosecutor_calls + dissent_calls
     context_len = len(str(args.get("context") or "")) + len(str(args.get("task") or ""))
     rough_input_chars = total_calls * min(MAX_PROMPT_CONTEXT_CHARS, max(4000, context_len + 6000))
     rough_output_tokens = total_calls * min(int(args.get("max_tokens") or DEFAULT_MAX_TOKENS), 32000)
     return {
         "model_calls": total_calls,
-        "breakdown": {"primary": primary_calls, "collaboration": collaboration_calls, "message": message_calls, "research": research_calls, "judge": judge_calls},
+        "breakdown": {"probe": probe_calls, "primary": primary_calls, "collaboration": collaboration_calls, "message": message_calls, "research": research_calls, "judge": judge_calls, "prosecutor": prosecutor_calls, "forced_dissent": dissent_calls},
         "rough_input_chars_upper": rough_input_chars,
         "rough_output_tokens_upper": rough_output_tokens,
         "latency_hint_seconds": f"{max(10, total_calls * 4)}-{max(30, total_calls * 18)}",
@@ -2230,6 +2676,11 @@ def handler(args=None, **_kw):
     dissent_required = _normalise_bool(args.get("dissent_required"), False)
     anti_slop = _normalise_bool(args.get("anti_slop"), False)
     self_review_round = _normalise_bool(args.get("self_review_round"), False)
+    plan_probe_decide = _normalise_bool(args.get("plan_probe_decide"), True)
+    prosecutor_round = _normalise_bool(args.get("prosecutor_round"), True)
+    minimum_objections = _clamp_int(args.get("minimum_objections"), 2, 0, 20)
+    compiler_judge = _normalise_bool(args.get("compiler_judge"), True)
+    save_council_lessons = _normalise_bool(args.get("save_council_lessons"), False)
     enabled_toolsets = _as_str_list(args.get("enabled_toolsets"))
     total_members = councils * members_per_council
     max_member_workers = _clamp_int(args.get("max_member_workers"), DEFAULT_MAX_MEMBER_WORKERS, 1, MAX_COUNCILS * MAX_MEMBERS_PER_COUNCIL)
@@ -2245,7 +2696,7 @@ def handler(args=None, **_kw):
     manifest = _build_capability_manifest({**args, "tool_mode": tool_mode, "agentic_blackboard": agentic_blackboard, "minimum_tools": minimum_tools, "brokered_tools": brokered_tools, "active_tool_agents": active_tool_agents, "mutating_agents": mutating_agents, "max_tool_requests": max_tool_requests}, ledger)
 
     if dry_run:
-        estimate = _estimate_budget(args, total_members, collaboration_rounds, message_rounds, research_missions, max_research_agents, self_review_round)
+        estimate = _estimate_budget(args, total_members, collaboration_rounds, message_rounds, research_missions, max_research_agents, self_review_round, plan_probe_decide, prosecutor_round, dissent_required)
         return _json({
             "status": "dry_run",
             "tool": "hermes_omnicouncil",
@@ -2260,6 +2711,11 @@ def handler(args=None, **_kw):
             "tool_mode": tool_mode,
             "capability_profile": manifest.get("capability_profile"),
             "fallback_models": _ACTIVE_FALLBACK_MODELS,
+            "plan_probe_decide": plan_probe_decide,
+            "prosecutor_round": prosecutor_round,
+            "compiler_judge": compiler_judge,
+            "minimum_objections": minimum_objections,
+            "save_council_lessons": save_council_lessons,
             "evidence": ledger if return_evidence else [],
         })
 
@@ -2277,6 +2733,8 @@ def handler(args=None, **_kw):
         "tool_mode": tool_mode, "capability_profile": manifest.get("capability_profile"),
         "dissent_required": dissent_required, "anti_slop": anti_slop, "self_review_round": self_review_round,
         "fallback_models": _ACTIVE_FALLBACK_MODELS, "json_schema": bool(json_schema),
+        "plan_probe_decide": plan_probe_decide, "prosecutor_round": prosecutor_round, "compiler_judge": compiler_judge,
+        "minimum_objections": minimum_objections, "save_council_lessons": save_council_lessons,
     }, manifest, default_model)
     cache_file = CACHE_DIR / f"{key}.json"
     if use_cache and cache_file.exists() and time.time() - cache_file.stat().st_mtime < cache_ttl_seconds:
@@ -2287,10 +2745,31 @@ def handler(args=None, **_kw):
         except Exception:
             pass
 
+    # ── Plan→Probe→Decide preflight
+    probe_plan: dict[str, Any] = {}
+    if plan_probe_decide:
+        probe_plan = _run_probe_phase(
+            task, context, mode, manifest, ledger, max_tool_requests,
+            model=research_model or default_model,
+            timeout=model_timeout,
+            retries=member_retries,
+            jitter_ms=request_jitter_ms,
+            max_workers=max_research_workers,
+        )
+        if probe_plan:
+            probe_context = _truncate_text(_json({
+                "unknowns": probe_plan.get("unknowns", []),
+                "risk_points": probe_plan.get("risk_points", []),
+                "expected_evidence": probe_plan.get("expected_evidence", []),
+                "tool_requests": probe_plan.get("tool_requests", []),
+            }), 40000)
+            context = context + "\n\n---\nPlan→Probe→Decide preflight:\n" + probe_context if context else "Plan→Probe→Decide preflight:\n" + probe_context
+
     # ── Research missions
     research_reports: list[dict[str, Any]] = []
     if research_missions and max_research_agents > 0:
         research_reports = _run_research_missions(task, mode, manifest, max_research_agents, enabled_toolsets, max_tokens, ledger, max_research_workers, request_jitter_ms, research_model=research_model)
+        _collect_claims_from_responses(research_reports, ledger)
 
     # ── Primary member calls
     answers: list[dict[str, Any]] = []
@@ -2317,12 +2796,15 @@ def handler(args=None, **_kw):
                 answers.append({"label": label, "council": ci + 1, "member": mi + 1, "perspective": perspective, "status": "failed", "error": _truncate_text(str(exc), 500)})
     answers.sort(key=lambda item: (int(item.get("council") or 0), int(item.get("member") or 0), str(item.get("label") or "")))
     _merge_blackboard_from_responses(blackboard, answers)
+    _collect_claims_from_responses(answers, ledger)
 
     succeeded = sum(1 for a in answers if a.get("status") == "success")
     tool_requests = _dedupe_tool_requests(answers, max_tool_requests, minimum_tools=minimum_tools)
     if tool_requests:
         _add_evidence(ledger, "tool_requests", f"Collected {len(tool_requests)} unique tool requests from members.", count=len(tool_requests))
         _execute_tool_requests(tool_requests, ledger, max_workers=max_research_workers)
+
+    dissent_report: dict[str, Any] = {}
 
     if succeeded < min_successful_members:
         transcript = []
@@ -2352,8 +2834,21 @@ def handler(args=None, **_kw):
             _execute_tool_requests(tool_requests, ledger, max_workers=max_research_workers)
         collaboration_responded = sum(1 for round_item in transcript for response in round_item.get("responses", []) if response.get("status") == "success")
 
+        _collect_claims_from_responses(all_responses, ledger)
+        if dissent_required:
+            dissent_report = _ensure_minimum_dissent(
+                task, context, all_responses, votes_summary, ledger,
+                minimum_objections=minimum_objections,
+                model=judge_model,
+                timeout=judge_timeout,
+                retries=member_retries,
+                jitter_ms=request_jitter_ms,
+            )
+            if dissent_report.get("generated"):
+                blackboard["forced_dissent"] = dissent_report.get("generated")
+
         try:
-            synthesis = _judge(task, context, mode, answers, judge_max_tokens, transcript, manifest, ledger, research_reports, tool_requests, all_messages, output_format, save_task_capsule, timeout=judge_timeout, retries=member_retries, strict_json=strict_json, decision_policy=decision_policy, red_team=red_team, jitter_ms=request_jitter_ms, json_schema=json_schema, judge_model=judge_model, dissent_required=dissent_required, anti_slop=anti_slop)
+            synthesis = _judge(task, context, mode, answers, judge_max_tokens, transcript, manifest, ledger, research_reports, tool_requests, all_messages, output_format, save_task_capsule, timeout=judge_timeout, retries=member_retries, strict_json=strict_json, decision_policy=decision_policy, red_team=red_team, jitter_ms=request_jitter_ms, json_schema=json_schema, judge_model=judge_model, dissent_required=dissent_required, anti_slop=anti_slop, compiler_judge=compiler_judge)
             status = "success"
             judge_error = ""
 
@@ -2383,6 +2878,18 @@ def handler(args=None, **_kw):
             synthesis = _fallback_synthesis(task, mode, answers, transcript, research_reports, tool_requests, f"judge failed: {judge_error}")
             status = "partial" if succeeded else "failed"
 
+    # ── Prosecutor + Judge compiler + compact lessons
+    prosecutor_report: dict[str, Any] = {}
+    if prosecutor_round and synthesis:
+        prosecutor_report = _run_prosecutor(
+            task, context, synthesis, ledger, votes_summary,
+            model=judge_model,
+            timeout=judge_timeout,
+            retries=member_retries,
+            jitter_ms=request_jitter_ms,
+        )
+    compiled_synthesis = _compile_judge_output(synthesis, ledger, votes_summary, prosecutor_report) if compiler_judge else {}
+
     # ── Result
     diagnostics = {
         "primary_success": succeeded,
@@ -2398,6 +2905,12 @@ def handler(args=None, **_kw):
         "agentic_blackboard": agentic_blackboard,
         "models": {"default": default_model, "member_count": len(member_models), "judge": judge_model, "research": research_model, "fallbacks": _ACTIVE_FALLBACK_MODELS},
         "votes": votes_summary,
+        "plan_probe_decide": plan_probe_decide,
+        "probe_executed": probe_plan.get("executed", 0) if isinstance(probe_plan, dict) else 0,
+        "prosecutor_verdict": prosecutor_report.get("verdict") if isinstance(prosecutor_report, dict) else None,
+        "compiler_judge": compiler_judge,
+        "claims": _claims_summary(ledger).get("by_status", {}),
+        "dissent": dissent_report,
         "warnings": [],
     }
 
@@ -2430,10 +2943,16 @@ def handler(args=None, **_kw):
         "dissent_required": dissent_required,
         "anti_slop": anti_slop,
         "self_review_round": self_review_round,
+        "plan_probe_decide": plan_probe_decide,
+        "prosecutor_round": prosecutor_round,
+        "compiler_judge": compiler_judge,
+        "minimum_objections": minimum_objections,
+        "save_council_lessons": save_council_lessons,
         "fallback_models": _ACTIVE_FALLBACK_MODELS,
         "votes": votes_summary,
         "seconds": round(time.time() - started, 1),
         "synthesis": synthesis,
+        "compiled_synthesis": compiled_synthesis,
         "tool_requests": tool_requests,
         "diagnostics": diagnostics,
         "editable_after": True,
@@ -2454,8 +2973,19 @@ def handler(args=None, **_kw):
     if return_transcript:
         result["transcript"] = transcript
         result["message_transcript"] = message_transcript
+    if probe_plan:
+        result["probe_plan"] = probe_plan
+    if dissent_report:
+        result["dissent_report"] = dissent_report
+    if prosecutor_report:
+        result["prosecutor_report"] = prosecutor_report
+    council_lessons = _derive_council_lessons(task, status, compiled_synthesis, prosecutor_report, diagnostics)
+    if council_lessons:
+        result["council_lessons"] = council_lessons
     if save_task_capsule:
         result["task_capsule"] = _save_task_capsule(task, synthesis, result, ledger, tool_requests)
+    if save_council_lessons and council_lessons:
+        result["council_lessons_saved"] = _persist_council_lessons(task, council_lessons, result)
     if judge_error:
         result["judge_error"] = judge_error
     if succeeded < total_members:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke tests for hermes-omnicouncil v5.2.0 agentic tooling layer."""
+"""Smoke tests for hermes-omnicouncil v5.3.0 agentic tooling layer."""
 from __future__ import annotations
 
 import importlib.util
@@ -11,7 +11,7 @@ spec = importlib.util.spec_from_file_location("hermes_omnicouncil_smoke", PLUGIN
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
-assert mod.VERSION == "5.2.0-agentic-tools-deepseek-default"
+assert mod.VERSION == "5.3.0-evidence-probe-prosecutor-compiler"
 assert mod.DEFAULT_MODEL == "deepseek-v4-pro"
 assert mod.DEFAULT_MAX_TOKENS == 384000
 assert mod.DEFAULT_JUDGE_MAX_TOKENS == 384000
@@ -63,6 +63,7 @@ for key in [
     "return_blackboard", "return_evidence", "output_format", "save_task_capsule",
     "decision_policy", "red_team", "auto_scale", "request_jitter_ms", "dry_run", "json_schema",
     "dissent_required", "anti_slop", "self_review_round",
+    "plan_probe_decide", "prosecutor_round", "minimum_objections", "compiler_judge", "save_council_lessons",
 ]:
     assert key in mod.SCHEMA["parameters"]["properties"], key
 
@@ -86,6 +87,17 @@ bb = mod._extract_blackboard_update('BLACKBOARD_UPDATE_JSON: {"facts":["f"],"ope
 assert bb["facts"] == ["f"]
 vote = mod._extract_vote('VOTE_JSON: {"vote":"approve","confidence":0.9,"risk":"low"}')
 assert vote["vote"] == "approve" and vote["risk"] == "low"
+
+# v5.3 evidence/probe/prosecutor/compiler helpers
+claims_ledger = []
+claims = mod._extract_claims('CLAIMS_JSON: [{"claim":"supported fact","evidence_refs":["E1"],"confidence":0.8}]', 'T')
+assert claims and claims[0]["claim"] == "supported fact"
+claim_id = mod._add_claim(claims_ledger, "T", "supported fact", evidence_refs=["E1"], confidence=0.8)
+assert claim_id == "C1" and mod._claims_summary(claims_ledger)["by_status"]["supported"] == 1
+probe = mod._extract_probe_plan('PROBE_PLAN_JSON: {"unknowns":["u"],"tool_requests":[{"tool":"web_search","args":{"query":"x"},"priority":5}],"risk_points":["r"],"expected_evidence":["e"]}')
+assert probe["unknowns"] == ["u"] and probe["tool_requests"][0]["tool"] == "web_search"
+compiled = mod._compile_judge_output('JUDGE_COMPILED_JSON: {"verdict":"ok","confirmed_findings":["C1"],"next_step":"ship"}', claims_ledger, {}, {})
+assert compiled["verdict"] == "ok" and compiled["next_step"] == "ship"
 
 # message extraction
 msgs = mod._extract_messages('Messages: [{"to":"C2M1","type":"question","content":"What about X?"}]')
@@ -150,6 +162,7 @@ try:
         "max_member_workers": 2,
         "min_successful_members": 1,
         "request_jitter_ms": 0,
+        "save_council_lessons": False,
     })
     data = json.loads(raw)
     assert data["status"] in ("partial", "success"), data
@@ -160,6 +173,9 @@ try:
     assert data.get("votes", {}).get("votes")
     assert data.get("dissent_required") is False
     assert data.get("fallback_models") == []
+    assert data.get("plan_probe_decide") is True
+    assert data.get("compiler_judge") is True
+    assert "compiled_synthesis" in data
     assert "hermes-omnicouncil" in mod.CACHE_DIR.as_posix()
 
     raw_off = mod.handler({
@@ -176,6 +192,7 @@ try:
         "return_evidence": False,
         "tool_mode": "off",
         "request_jitter_ms": 0,
+        "prosecutor_round": False,
     })
     data_off = json.loads(raw_off)
     assert data_off["tool_mode"] == "off"
@@ -222,4 +239,4 @@ finally:
     mod.call_model = old_call
     mod.CACHE_DIR = old_cache
 
-print(f"hermes-omnicouncil v5.2.0 smoke ok: tools={len(registered)} calls={len(calls)} member_models={data.get('member_model_count')} messages_rounds={data.get('message_rounds')}")
+print(f"hermes-omnicouncil v5.3.0 smoke ok: tools={len(registered)} calls={len(calls)} member_models={data.get('member_model_count')} messages_rounds={data.get('message_rounds')}")
