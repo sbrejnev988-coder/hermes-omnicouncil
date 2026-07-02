@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.bak*
+*.backup
+.env
+.env.*
+*.db
+*.sqlite*
+logs/
+sessions/
+backups/
+snapshots/
+*.DS_Store

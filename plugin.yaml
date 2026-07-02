@@ -1,0 +1,31 @@
+name: hermes-omnicouncil
+version: 5.3.2
+description: "Hermes OmniCouncil v5.3.2 — DeepSeek-first agentic council with structured evidence ledger, Plan→Probe→Decide preflight, prosecutor audit, forced dissent, real decision_policy enforcement (majority/consensus), weak-request filtering, recursive JSON schema validation, judge compiler, registry-backed safe brokered tools, direct memory-wiki fallback, Auto-Debate/VerifyChain mode, doctor/cache tools, and deep_web_crawl management."
+tools:
+  - hermes_omnicouncil
+  - omnicouncil_doctor
+  - omnicouncil_cache_list
+  - omnicouncil_cache_get
+  - omnicouncil_cache_clear
+  - omnicouncil_cache_explain_key
+  - deep_web_crawl
+  - deep_web_status
+  - deep_web_open_report
+  - deep_web_query_sources
+  - deep_web_delete_job
+  - deep_web_export
+  - deep_web_resume
+provides_tools:
+  - hermes_omnicouncil
+  - omnicouncil_doctor
+  - omnicouncil_cache_list
+  - omnicouncil_cache_get
+  - omnicouncil_cache_clear
+  - omnicouncil_cache_explain_key
+  - deep_web_crawl
+  - deep_web_status
+  - deep_web_open_report
+  - deep_web_query_sources
+  - deep_web_delete_job
+  - deep_web_export
+  - deep_web_resume
