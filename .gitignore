@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.bak*
+*.backup*
+backups/
+.patch_backups/
+*.db
+*.sqlite3
+.env
+.vscode/
+.idea/
