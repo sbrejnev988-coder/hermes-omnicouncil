@@ -30,7 +30,7 @@ Add to `~/.hermes/config.yaml`:
 ```yaml
 plugins:
   enabled:
-    - hermes-memory-wiki
+    - memory-wiki
     - hermes-omnicouncil
 
   entries:
