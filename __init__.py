@@ -1057,7 +1057,14 @@ def _local_search_files(args: dict[str, Any]) -> dict[str, Any]:
     pattern = str(args.get("pattern") or "")
     if not pattern:
         return {"ok": False, "error": "pattern_required"}
-    base = Path(str(args.get("path") or ".")).expanduser()
+    base_path = str(args.get("path") or ".")
+    if _FIREWALL is not None:
+        ok_sf, resolved, reason = _firewall_resolve_safe(base_path)
+        if not ok_sf:
+            return {"ok": False, "error": f"firewall_blocked: {reason}", "path": str(resolved)}
+        base = resolved
+    else:
+        base = Path(base_path).expanduser()
     target = str(args.get("target") or "content")
     limit = _clamp_int(args.get("limit"), 50, 1, 200)
     if not base.exists():

@@ -484,7 +484,14 @@ def _fetch(url: str, timeout: int, cache_ttl_seconds: int, force_refresh: bool, 
     _rate_limit(url, rate_limit_seconds)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,text/plain,application/json;q=0.8,*/*;q=0.2"})
     # Bypass broken HTTP_PROXY in proot environment
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    # Build opener that blocks redirects to private IPs BEFORE sending request
+    class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req2, fp, code, msg, hdrs, newurl):
+            ok_srf, _, reason_srf = _url_allowed_by_policy(newurl, allow_private_urls=False)
+            if not ok_srf:
+                raise urllib.error.URLError(f"SSRF blocked redirect to {newurl}: {reason_srf}")
+            return urllib.request.HTTPRedirectHandler.redirect_request(self, req2, fp, code, msg, hdrs, newurl)
+    opener = urllib.request.build_opener(_SafeRedirectHandler(), urllib.request.ProxyHandler({}))
     try:
         with opener.open(req, timeout=timeout) as resp:
             # SSRF: check final URL after redirects
