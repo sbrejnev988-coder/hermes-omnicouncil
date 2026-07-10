@@ -1088,6 +1088,11 @@ def _local_search_files(args: dict[str, Any]) -> dict[str, Any]:
     for p in paths:
         if not p.is_file():
             continue
+        # Per-file sandbox: re-check each file for symlink escape
+        if _FIREWALL is not None:
+            ok_f, _, _ = _firewall_resolve_safe(str(p))
+            if not ok_f:
+                continue
         try:
             if p.stat().st_size > 2_000_000:
                 continue
