@@ -26,10 +26,13 @@ from pathlib import Path
 
 # ── OmniCouncil Firewall (file sandbox + SSRF) ──
 try:
-    from firewall import FirewallGate, resolve_safe as _firewall_resolve_safe
-    _FIREWALL = FirewallGate(require_firewall=True)
+    from .firewall import FirewallGate, resolve_safe as _firewall_resolve_safe
 except ImportError:
-    _FIREWALL = None
+    try:
+        from firewall import FirewallGate, resolve_safe as _firewall_resolve_safe
+    except ImportError:
+        FirewallGate = None
+_FIREWALL = FirewallGate(require_firewall=True) if FirewallGate is not None else None
 from typing import Any
 
 _EVEY_UTILS_PATH = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "evey_utils.py")
@@ -1045,16 +1048,9 @@ def _local_read_file(args: dict[str, Any]) -> dict[str, Any]:
     path = str(args.get("path") or "")
     offset = _clamp_int(args.get("offset"), 1, 1, 10_000_000)
     limit = _clamp_int(args.get("limit"), 500, 1, 2000)
-    if _FIREWALL is not None:
-        return _FIREWALL.file_read(path, offset, limit)
-    # Legacy fallback
-    p = Path(path).expanduser()
-    if not p.exists() or not p.is_file():
-        return {"ok": False, "error": "file_not_found", "path": str(p)}
-    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-    selected = lines[offset - 1: offset - 1 + limit]
-    body = "\n".join(f"{offset + idx}|{line}" for idx, line in enumerate(selected))
-    return {"ok": True, "source": "local_file_fallback", "path": str(p), "content": _truncate_text(body, 100000), "total_lines": len(lines)}
+    if _FIREWALL is None:
+        return {"ok": False, "error": "firewall_unavailable", "path": path}
+    return _FIREWALL.file_read(path, offset, limit)
 
 
 def _local_search_files(args: dict[str, Any]) -> dict[str, Any]:
