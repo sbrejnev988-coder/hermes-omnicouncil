@@ -1562,7 +1562,7 @@ def _tool_manifest(profile: str, enabled_toolsets: list[str]) -> dict[str, Any]:
     return {"profile": profile, "toolsets": result, "safe_agent_tools": SAFE_AGENT_TOOLS}
 
 
-def _build_capability_manifest(args: dict[str, Any], ledger: list[dict[str, Any]]) -> dict[str, Any]:
+def _build_capability_manifest(args: dict[str, Any], ledger: list[dict[str, Any]], *, critical_change_policy: str = "propose_only", allow_file_mutations: bool = False, allow_code_mutations: bool = False) -> dict[str, Any]:
     profile = args.get("capability_profile") or "omni"
     if profile not in CAPABILITY_PROFILES:
         profile = "omni"

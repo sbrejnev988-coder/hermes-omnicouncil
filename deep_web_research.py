@@ -487,7 +487,7 @@ def _fetch(url: str, timeout: int, cache_ttl_seconds: int, force_refresh: bool, 
     # Build opener that blocks redirects to private IPs BEFORE sending request
     class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req2, fp, code, msg, hdrs, newurl):
-            ok_srf, _, reason_srf = _url_allowed_by_policy(newurl, allow_private_urls=False)
+            ok_srf, reason_srf = _url_allowed_by_policy(newurl, allow_private_urls=False)
             if not ok_srf:
                 raise urllib.error.URLError(f"SSRF blocked redirect to {newurl}: {reason_srf}")
             return urllib.request.HTTPRedirectHandler.redirect_request(self, req2, fp, code, msg, hdrs, newurl)
