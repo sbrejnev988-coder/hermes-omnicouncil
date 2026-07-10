@@ -23,6 +23,13 @@ import random
 import re
 import time
 from pathlib import Path
+
+# ── OmniCouncil Firewall (file sandbox + SSRF) ──
+try:
+    from firewall import FirewallGate, resolve_safe as _firewall_resolve_safe
+    _FIREWALL = FirewallGate(require_firewall=True)
+except ImportError:
+    _FIREWALL = None
 from typing import Any
 
 _EVEY_UTILS_PATH = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "evey_utils.py")
@@ -1035,15 +1042,19 @@ def _local_skill_view(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _local_read_file(args: dict[str, Any]) -> dict[str, Any]:
-    path = Path(str(args.get("path") or "")).expanduser()
-    if not path.exists() or not path.is_file():
-        return {"ok": False, "error": "file_not_found", "path": str(path)}
+    path = str(args.get("path") or "")
     offset = _clamp_int(args.get("offset"), 1, 1, 10_000_000)
     limit = _clamp_int(args.get("limit"), 500, 1, 2000)
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if _FIREWALL is not None:
+        return _FIREWALL.file_read(path, offset, limit)
+    # Legacy fallback
+    p = Path(path).expanduser()
+    if not p.exists() or not p.is_file():
+        return {"ok": False, "error": "file_not_found", "path": str(p)}
+    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
     selected = lines[offset - 1: offset - 1 + limit]
     body = "\n".join(f"{offset + idx}|{line}" for idx, line in enumerate(selected))
-    return {"ok": True, "source": "local_file_fallback", "path": str(path), "content": _truncate_text(body, 100000), "total_lines": len(lines)}
+    return {"ok": True, "source": "local_file_fallback", "path": str(p), "content": _truncate_text(body, 100000), "total_lines": len(lines)}
 
 
 def _local_search_files(args: dict[str, Any]) -> dict[str, Any]:
@@ -2063,6 +2074,18 @@ def _prefetch_memory_context(task: str, context: str, max_chars: int, ledger: li
 # ═══════════════════════════════════════════════════════════════
 #  web_research_brief (composite web search + extract summarisation)
 # ═══════════════════════════════════════════════════════════════
+
+def _safe_fetch(url: str, timeout: float = 10.0) -> dict[str, Any]:
+    """Fetch URL with firewall SSRF protection."""
+    if _FIREWALL is not None:
+        return _FIREWALL.fetch_url(url, timeout)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Hermes-OmniCouncil/5.5"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return {"ok": True, "data": resp.read().decode("utf-8", errors="replace")[:50000]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 def _web_research_brief(query: str, max_sources: int = 5, ledger: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     brief: dict[str, Any] = {"query": query, "sources": [], "summary": ""}
     search_result = _execute_safe_tool("web_search", {"query": query, "limit": max_sources})

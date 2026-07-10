@@ -29,6 +29,22 @@ jobs:
     - name: Run smoke test
       run: python3 scripts/smoke_test.py 2>&1 | tail -30
       
+    
+    - name: Firewall tests
+      run: |
+        python3 -c "
+import sys; sys.path.insert(0,'.')
+from firewall import resolve_safe, validate_url, is_ip_blocked
+assert is_ip_blocked('127.0.0.1'), 'localhost should be blocked'
+assert is_ip_blocked('192.168.1.1'), 'private IP should be blocked'
+assert not is_ip_blocked('8.8.8.8'), 'public IP should be allowed'
+ok, _, _ = resolve_safe('test.txt')
+assert ok, 'relative path should be safe'
+ok2, _, _ = resolve_safe('/etc/passwd')
+assert not ok2, 'absolute path should be blocked'
+print('FIREWALL OK')
+"
+
     - name: Verify tools registration
       run: |
         python3 -c "
