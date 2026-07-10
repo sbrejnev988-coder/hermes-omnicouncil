@@ -1440,6 +1440,9 @@ def _build_blackboard_policy(
     mutating_agents: int,
     minimum_tools: bool = True,
     brokered_tools: bool = True,
+    critical_change_policy: str = "propose_only",
+    allow_file_mutations: bool = False,
+    allow_code_mutations: bool = False,
 ) -> dict[str, Any]:
     return {
         "enabled": True,

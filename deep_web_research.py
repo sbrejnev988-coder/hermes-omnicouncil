@@ -487,6 +487,12 @@ def _fetch(url: str, timeout: int, cache_ttl_seconds: int, force_refresh: bool, 
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         with opener.open(req, timeout=timeout) as resp:
+            # SSRF: check final URL after redirects
+            final_url = resp.geturl() if hasattr(resp, 'geturl') else url
+            if final_url != url:
+                ok_rd, why_rd = _url_allowed_by_policy(final_url, allow_private_urls=allow_private_urls, allowed_domains=allowed_domains, blocked_domains=blocked_domains)
+                if not ok_rd:
+                    return {"url": url, "final_url": final_url, "status": 0, "content_type": "", "body": "", "error": f"SSRF blocked redirect: {why_rd}", "cached": False, "policy_blocked": True}
             raw = resp.read(MAX_FETCH_BYTES)
             ctype = resp.headers.get("content-type", "")
             charset = resp.headers.get_content_charset() or "utf-8"
