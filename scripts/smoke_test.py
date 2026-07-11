@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 PLUGIN = Path(__file__).resolve().parents[1] / "__init__.py"
-spec = importlib.util.spec_from_file_location("hermes_omnicouncil_smoke", PLUGIN)
+spec = importlib.util.spec_from_file_location(
+    "hermes_omnicouncil",
+    str(PLUGIN),
+    submodule_search_locations=[str(PLUGIN.parent)],
+)
 mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod
 spec.loader.exec_module(mod)
 
 # ═══════════════════════════════════════════════════════════════
