@@ -1545,7 +1545,8 @@ def _scan_skills(ledger: list[dict[str, Any]], selected: list[str] | None = None
 
 
 def _scan_mcp(ledger: list[dict[str, Any]]) -> dict[str, Any]:
-    candidates = [Path.home() / ".hermes" / "config.yaml", Path("/root/.hermes/config.yaml")]
+    hermes_home = Path(_os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    candidates = [hermes_home / "config.yaml"]
     found: list[dict[str, Any]] = []
     for cfg in candidates:
         if not cfg.exists():
