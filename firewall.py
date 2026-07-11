@@ -267,13 +267,15 @@ def safe_urlopen(url: str, timeout: float = 30.0, max_redirects: int = 5) -> Tup
             opener = urllib.request.build_opener(NoRedirectHandler())
 
             with opener.open(req, timeout=timeout) as resp:
-                # Check for redirect
+                # Handle redirects — validate each target URL
                 if resp.status in (301, 302, 303, 307, 308):
                     new_url = resp.headers.get("Location", "")
                     if not new_url:
                         return False, {"error": "redirect without Location header"}
-                    # Resolve relative redirects
                     current_url = urllib.parse.urljoin(current_url, new_url)
+                    safe_rd, _, reason_rd = validate_url(current_url)
+                    if not safe_rd:
+                        return False, {"error": f"SSRF blocked redirect: {reason_rd}", "url": current_url}
                     redirect_count += 1
                     continue
 
