@@ -244,9 +244,25 @@ def safe_urlopen(url: str, timeout: float = 30.0, max_redirects: int = 5) -> Tup
     import urllib.error
 
     current_url = url
-    redirect_count = 0
+    # Use a mutable list to share the counter with the nested class
+    _counter = [0]
 
-    while redirect_count <= max_redirects:
+    class ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self_, req, fp, code, msg, headers, newurl):
+            if _counter[0] >= max_redirects:
+                return None
+            new_url = urllib.parse.urljoin(req.get_full_url(), newurl)
+            safe, _, reason = validate_url(new_url)
+            if not safe:
+                return None  # block this redirect → HTTPError
+            _counter[0] += 1
+            return urllib.request.Request(new_url, headers={
+                "User-Agent": "OmniCouncil-Firewall/1.0"
+            })
+
+    opener = urllib.request.build_opener(ValidatingRedirectHandler())
+
+    while True:
         safe, _, reason = validate_url(current_url)
         if not safe:
             return False, {"error": f"firewall_blocked: {reason}", "url": current_url}
@@ -256,39 +272,27 @@ def safe_urlopen(url: str, timeout: float = 30.0, max_redirects: int = 5) -> Tup
                 "User-Agent": "OmniCouncil-Firewall/1.0"
             })
 
-            # Don't follow redirects automatically — we validate each one
-            opener = urllib.request.build_opener(
-                urllib.request.HTTPRedirectHandler()
-            )
-            # Override to NOT follow redirects automatically
-            class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-                def redirect_request(self, req, fp, code, msg, headers, newurl):
-                    return None
-            opener = urllib.request.build_opener(NoRedirectHandler())
-
             with opener.open(req, timeout=timeout) as resp:
-                # Handle redirects — validate each target URL
-                if resp.status in (301, 302, 303, 307, 308):
-                    new_url = resp.headers.get("Location", "")
-                    if not new_url:
-                        return False, {"error": "redirect without Location header"}
-                    current_url = urllib.parse.urljoin(current_url, new_url)
-                    safe_rd, _, reason_rd = validate_url(current_url)
-                    if not safe_rd:
-                        return False, {"error": f"SSRF blocked redirect: {reason_rd}", "url": current_url}
-                    redirect_count += 1
-                    continue
-
                 data = resp.read().decode("utf-8", errors="replace")
                 return True, {
                     "ok": True,
                     "status": resp.status,
-                    "url": current_url,
+                    "url": resp.geturl(),
                     "content": data[:50000],
                     "content_type": resp.headers.get("Content-Type", ""),
                 }
 
         except urllib.error.HTTPError as e:
+            # ValidatingRedirectHandler returns None for blocked/bad redirects → HTTPError
+            if e.code in (301, 302, 303, 307, 308):
+                new_url = e.headers.get("Location", "")
+                if not new_url:
+                    return False, {"error": "redirect without Location header", "url": current_url}
+                current_url = urllib.parse.urljoin(current_url, new_url)
+                safe, _, reason = validate_url(current_url)
+                if not safe:
+                    return False, {"error": f"SSRF blocked redirect: {reason}", "url": current_url}
+                continue
             return False, {"error": f"HTTP {e.code}: {e.reason}", "url": current_url}
         except urllib.error.URLError as e:
             return False, {"error": f"URL error: {e.reason}", "url": current_url}
