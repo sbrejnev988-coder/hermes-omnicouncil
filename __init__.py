@@ -1595,6 +1595,9 @@ def _build_capability_manifest(args: dict[str, Any], ledger: list[dict[str, Any]
             mutating_agents=_clamp_int(args.get("mutating_agents"), AGENTIC_MUTATING_AGENTS, 0, 0),
             minimum_tools=minimum_tools,
             brokered_tools=brokered_tools,
+            critical_change_policy=str(args.get("critical_change_policy") or "propose_only"),
+            allow_file_mutations=bool(args.get("allow_file_mutations")),
+            allow_code_mutations=bool(args.get("allow_code_mutations")),
         )
     if _normalise_bool(args.get("auto_capability_scan"), True):
         manifest["plugins"] = _scan_plugins(ledger)
