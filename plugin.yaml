@@ -1,5 +1,5 @@
 name: hermes-omnicouncil
-version: 5.5.0
+version: 5.6.0
 description: "Hermes OmniCouncil v5.5.0 — консилиум из ЛЮБЫХ моделей (OpenRouter, Anthropic, OpenAI, DeepSeek, локальные, custom) через provider:model синтаксис. Council-safe режим: модели читают workspace/memory + пишут blackboard, мутации — только operator. COUNCIL_DENIED_TOOLS (12 шт), broker_tool_call единая точка входа, двухуровневый blackboard (ephemeral + durable memory-wiki), MUTATION_POLICY (propose_only/judge_approved/operator_only). Presets — только sizing, модели — из аргументов пользователя."
 tools:
   - hermes_omnicouncil

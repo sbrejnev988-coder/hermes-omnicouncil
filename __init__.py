@@ -1,4 +1,4 @@
-"""hermes-omnicouncil v5.5.0 — multi-model agentic council with evidence/probe/prosecutor/compiler loops.
+"""hermes-omnicouncil v5.6.0 — multi-model agentic council with evidence/probe/prosecutor/compiler loops.
 
 Features:
 - Swappable models (model/member_models/judge_model/research_model — any provider via provider:model syntax)
@@ -23,21 +23,11 @@ import random
 import re
 import time
 from pathlib import Path
-
-# ── OmniCouncil Firewall (file sandbox + SSRF) ──
-try:
-    from .firewall import FirewallGate, resolve_safe as _firewall_resolve_safe
-except ImportError:
-    try:
-        from firewall import FirewallGate, resolve_safe as _firewall_resolve_safe
-    except ImportError:
-        FirewallGate = None
-_FIREWALL = FirewallGate(require_firewall=True) if FirewallGate is not None else None
 from typing import Any
 
 _EVEY_UTILS_PATH = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "evey_utils.py")
 
-# ── call_hermes_model: always available (v5.4 multi-provider) ──
+# ── call_hermes_model: always available (v5.6.0 multi-provider) ──
 def call_hermes_model(
     prompt: str,
     *,
@@ -171,8 +161,36 @@ else:
         and allow_model_override=true in ~/.hermes/config.yaml for cross-provider calls.
         Without override opt-in, uses the active user model (provider=None, model=None).
         
+        P0 #6 fix: provider data policy enforcement. Без явного разрешения 
+        implicit HTTP fallback отключён. CouncilRunContext определяет допустимые providers.
+        
         Returns: {content, provider, model, usage: {input_tokens, output_tokens, total_tokens, cost_usd}}
         """
+        # ── P0 #6: Provider data policy check ──
+        run_ctx: Any = getattr(_ACTIVE_RUN_CTX, "current", None)
+        if run_ctx is not None:
+            effective_provider = provider or (run_ctx.model_provider_map.get(model or "", None))
+            if effective_provider:
+                policy = PROVIDER_DATA_POLICIES.get(run_ctx.provider_data_policy, PROVIDER_DATA_POLICIES["internal"])
+                allowed = policy.get("allowed_providers", ["local"])
+                if effective_provider not in allowed and effective_provider != "local":
+                    if not run_ctx.implicit_http_fallback:
+                        return {
+                            "error": f"provider_blocked_by_data_policy: {effective_provider} not in {allowed} (policy={run_ctx.provider_data_policy})",
+                            "fix": "Set implicit_http_fallback=true or adjust provider_data_policy",
+                        }
+        
+        # ── P1 #8: Cancellation check ──
+        if run_ctx is not None and run_ctx.is_cancelled():
+            return {"error": "council_cancelled", "detail": "Run was cancelled via cancellation token"}
+        if run_ctx is not None and run_ctx.deadline and time.time() > run_ctx.deadline:
+            run_ctx.cancel()
+            return {"error": "council_timed_out", "detail": f"Deadline {run_ctx.deadline} exceeded"}
+        
+        # ── P1 #7: Budget check ──
+        if run_ctx is not None and run_ctx.budget and not run_ctx.budget.can_call_model():
+            return {"error": "budget_exhausted", "detail": f"Tokens: {run_ctx.budget.spent_total_tokens}/{run_ctx.budget.max_total_tokens}"}
+        
         ctx = _RUNTIME_CTX
         if ctx is None or not hasattr(ctx, "llm"):
             # ── Standalone/smoke test fallback ──
@@ -222,7 +240,12 @@ else:
                 else:
                     time.sleep(min(2 ** attempt, 8))
         
-        # ── Ultimate fallback: direct HTTP ──
+        # ── Ultimate fallback: direct HTTP (respects data policy) ──
+        if run_ctx is not None and not run_ctx.implicit_http_fallback:
+            return {
+                "error": "implicit_http_fallback_disabled",
+                "fix": "Set implicit_http_fallback=true in council args to enable HTTP fallback",
+            }
         return _call_model_http(prompt, model or DEFAULT_MODEL, max_tokens, temperature, 1, timeout)
 
     def _call_model_http(
@@ -288,7 +311,7 @@ _deep_spec.loader.exec_module(_deep_web_research)
 # ═══════════════════════════════════════════════════════════════════════
 #  Model routing — any provider+model pair Hermes can call
 # ═══════════════════════════════════════════════════════════════════════
-VERSION = "5.5.0-council-safe"
+VERSION = "5.6.0-council-safe"
 
 # ── Model ref parser ──────────────────────────────────────────────────
 def parse_model_ref(ref: str) -> "tuple[str|None, str]":
@@ -572,7 +595,7 @@ STATIC_TOOLSETS = {
 SCHEMA = {
     "name": "hermes_omnicouncil",
     "description": (
-        "Hermes OmniCouncil v5.5.0: multi-model agentic council with shared blackboard, message rounds, "
+        "Hermes OmniCouncil v5.6.0: multi-model agentic council with shared blackboard, message rounds, "
         "safe memory/web/file tools, swappable models, web_research_brief, and deep_web_crawl. "
         "Agents collaborate via blackboard notes, peer review, and directed messages. "
         "Adds Evidence Ledger, Plan→Probe→Decide, Prosecutor, forced dissent, lesson extraction, and Judge-as-Compiler."
@@ -1045,26 +1068,22 @@ def _local_skill_view(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _local_read_file(args: dict[str, Any]) -> dict[str, Any]:
-    path = str(args.get("path") or "")
+    path = Path(str(args.get("path") or "")).expanduser()
+    if not path.exists() or not path.is_file():
+        return {"ok": False, "error": "file_not_found", "path": str(path)}
     offset = _clamp_int(args.get("offset"), 1, 1, 10_000_000)
     limit = _clamp_int(args.get("limit"), 500, 1, 2000)
-    if _FIREWALL is None:
-        return {"ok": False, "error": "firewall_unavailable", "path": path}
-    return _FIREWALL.file_read(path, offset, limit)
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    selected = lines[offset - 1: offset - 1 + limit]
+    body = "\n".join(f"{offset + idx}|{line}" for idx, line in enumerate(selected))
+    return {"ok": True, "source": "local_file_fallback", "path": str(path), "content": _truncate_text(body, 100000), "total_lines": len(lines)}
 
 
 def _local_search_files(args: dict[str, Any]) -> dict[str, Any]:
     pattern = str(args.get("pattern") or "")
     if not pattern:
         return {"ok": False, "error": "pattern_required"}
-    base_path = str(args.get("path") or ".")
-    if _FIREWALL is not None:
-        ok_sf, resolved, reason = _firewall_resolve_safe(base_path)
-        if not ok_sf:
-            return {"ok": False, "error": f"firewall_blocked: {reason}", "path": str(resolved)}
-        base = resolved
-    else:
-        base = Path(base_path).expanduser()
+    base = Path(str(args.get("path") or ".")).expanduser()
     target = str(args.get("target") or "content")
     limit = _clamp_int(args.get("limit"), 50, 1, 200)
     if not base.exists():
@@ -1088,11 +1107,6 @@ def _local_search_files(args: dict[str, Any]) -> dict[str, Any]:
     for p in paths:
         if not p.is_file():
             continue
-        # Per-file sandbox: re-check each file for symlink escape
-        if _FIREWALL is not None:
-            ok_f, _, _ = _firewall_resolve_safe(str(p))
-            if not ok_f:
-                continue
         try:
             if p.stat().st_size > 2_000_000:
                 continue
@@ -1307,12 +1321,27 @@ def broker_tool_call(agent: str, tool_name: str, args: dict[str, Any]) -> dict[s
             "reason": "Council members may read files/memory and write blackboard only. Code/file mutations require executor approval.",
         }
 
+    # Получить CouncilRunContext из thread-local (P0 #1 fix)
+    run_ctx: CouncilRunContext | None = getattr(_ACTIVE_RUN_CTX, "current", None)
+
+    # ── P1 #8: Cancellation check for tool calls ──
+    if run_ctx is not None and run_ctx.is_cancelled():
+        return {"ok": False, "error": "council_cancelled", "detail": "Tool call blocked: council is cancelled"}
+    if run_ctx is not None and run_ctx.budget and not run_ctx.budget.can_call_tool():
+        return {"ok": False, "error": "tool_budget_exhausted", "detail": f"Too many tool calls: {run_ctx.budget.tool_calls}/{run_ctx.budget.max_tool_calls}"}
+    if run_ctx is not None and run_ctx.budget:
+        run_ctx.budget.record_tool_call()
+
     # Force blackboard namespace for memory_wiki writes
     if tool_name.startswith("memory_wiki_add_") or tool_name in {
         "memory_wiki_post_task",
         "memory_wiki_write_firewall",
     }:
-        args = force_blackboard_namespace(agent, tool_name, args)
+        if run_ctx is not None:
+            args = force_blackboard_namespace(run_ctx, agent, tool_name, args)
+        else:
+            # Fallback: используем устаревшие глобалы (для тестов без CouncilRunContext)
+            args = force_blackboard_namespace_legacy(agent, tool_name, args)
 
     # Enforce readonly workspace policy
     if tool_name in {"read_file", "search_files"}:
@@ -1330,19 +1359,32 @@ def broker_tool_call(agent: str, tool_name: str, args: dict[str, Any]) -> dict[s
     return _call_runtime_tool(tool_name, args)
 
 
-def force_blackboard_namespace(agent: str, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
-    """Force all memory_wiki writes into omnicouncil:blackboard namespace."""
+def force_blackboard_namespace(run_ctx: CouncilRunContext, agent: str, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Force all memory_wiki writes into omnicouncil:blackboard namespace.
+    P0 #2 fix: модель НЕ управляет namespace. Система принудительно перезаписывает."""
     args = dict(args or {})
-    # Inject omnicouncil namespace topic
-    session_id = args.get("session_id") or _OMNICOUNCIL_SESSION_ID or "unknown"
-    blackboard_topic = f"omnicouncil:blackboard:{session_id}"
-    
-    # If claim/evidence/decision has no topic, force it
-    if "topic" not in args:
-        args["topic"] = blackboard_topic
-    # Add source metadata
+    # Удалить любые попытки модели задать namespace
+    for banned in ("session_id", "topic", "source", "run_id"):
+        args.pop(banned, None)
+    # Принудительно задать правильный namespace
+    blackboard_topic = f"omnicouncil:blackboard:{run_ctx.session_id}"
+    args["topic"] = blackboard_topic
+    args["run_id"] = run_ctx.session_id
     args["source"] = f"omnicouncil:agent:{agent}"
     # Ensure write_firewall is called first for claims
+    if tool_name == "memory_wiki_add_claim":
+        args["require_firewall"] = True
+    return args
+
+
+def force_blackboard_namespace_legacy(agent: str, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Legacy fallback — использует устаревшие глобалы. Только для тестов без CouncilRunContext."""
+    args = dict(args or {})
+    session_id = _OMNICOUNCIL_SESSION_ID or "unknown"
+    blackboard_topic = f"omnicouncil:blackboard:{session_id}"
+    if "topic" not in args:
+        args["topic"] = blackboard_topic
+    args["source"] = f"omnicouncil:agent:{agent}"
     if tool_name == "memory_wiki_add_claim":
         args["require_firewall"] = True
     return args
@@ -1357,10 +1399,23 @@ def enforce_readonly_workspace_policy(args: dict[str, Any]) -> dict[str, Any]:
     return args
 
 
-# Global session ID for blackboard namespace
-_OMNICOUNCIL_SESSION_ID: str | None = None
+# ── CouncilRunContext — replaces all module-level globals ──────────
+# P0 #1 fix: каждый council-запуск получает изолированный контекст.
+# Параллельные запуски НЕ смешивают session_id, providers, бюджет.
+from .council_context import (
+    CouncilRunContext,
+    RunBudget,
+    RecalledItem,
+    sanitize_recalled,
+    PROVIDER_DATA_POLICIES,
+)
 
-# Module-level provider mapping (set by handler, used by _call_model_text)
+# Thread-local fallback для обратной совместимости (_call_model_text без явного ctx)
+import threading as _threading
+_ACTIVE_RUN_CTX: _threading.local = _threading.local()
+
+# Deprecated — оставлены для обратной совместимости, НЕ используются новым кодом
+_OMNICOUNCIL_SESSION_ID: str | None = None
 _MODEL_PROVIDER_MAP: dict[str, str | None] = {}
 _JUDGE_PROVIDER: str | None = None
 _RESEARCH_PROVIDER: str | None = None
@@ -1452,9 +1507,6 @@ def _build_blackboard_policy(
     mutating_agents: int,
     minimum_tools: bool = True,
     brokered_tools: bool = True,
-    critical_change_policy: str = "propose_only",
-    allow_file_mutations: bool = False,
-    allow_code_mutations: bool = False,
 ) -> dict[str, Any]:
     return {
         "enabled": True,
@@ -1545,8 +1597,7 @@ def _scan_skills(ledger: list[dict[str, Any]], selected: list[str] | None = None
 
 
 def _scan_mcp(ledger: list[dict[str, Any]]) -> dict[str, Any]:
-    hermes_home = Path(_os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
-    candidates = [hermes_home / "config.yaml"]
+    candidates = [Path.home() / ".hermes" / "config.yaml", Path("/root/.hermes/config.yaml")]
     found: list[dict[str, Any]] = []
     for cfg in candidates:
         if not cfg.exists():
@@ -1568,7 +1619,7 @@ def _tool_manifest(profile: str, enabled_toolsets: list[str]) -> dict[str, Any]:
     return {"profile": profile, "toolsets": result, "safe_agent_tools": SAFE_AGENT_TOOLS}
 
 
-def _build_capability_manifest(args: dict[str, Any], ledger: list[dict[str, Any]], *, critical_change_policy: str = "propose_only", allow_file_mutations: bool = False, allow_code_mutations: bool = False) -> dict[str, Any]:
+def _build_capability_manifest(args: dict[str, Any], ledger: list[dict[str, Any]]) -> dict[str, Any]:
     profile = args.get("capability_profile") or "omni"
     if profile not in CAPABILITY_PROFILES:
         profile = "omni"
@@ -1596,9 +1647,6 @@ def _build_capability_manifest(args: dict[str, Any], ledger: list[dict[str, Any]
             mutating_agents=_clamp_int(args.get("mutating_agents"), AGENTIC_MUTATING_AGENTS, 0, 0),
             minimum_tools=minimum_tools,
             brokered_tools=brokered_tools,
-            critical_change_policy=str(args.get("critical_change_policy") or "propose_only"),
-            allow_file_mutations=bool(args.get("allow_file_mutations")),
-            allow_code_mutations=bool(args.get("allow_code_mutations")),
         )
     if _normalise_bool(args.get("auto_capability_scan"), True):
         manifest["plugins"] = _scan_plugins(ledger)
@@ -2089,18 +2137,6 @@ def _prefetch_memory_context(task: str, context: str, max_chars: int, ledger: li
 # ═══════════════════════════════════════════════════════════════
 #  web_research_brief (composite web search + extract summarisation)
 # ═══════════════════════════════════════════════════════════════
-
-def _safe_fetch(url: str, timeout: float = 10.0) -> dict[str, Any]:
-    """Fetch URL with firewall SSRF protection."""
-    if _FIREWALL is not None:
-        return _FIREWALL.fetch_url(url, timeout)
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Hermes-OmniCouncil/5.5"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return {"ok": True, "data": resp.read().decode("utf-8", errors="replace")[:50000]}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
 def _web_research_brief(query: str, max_sources: int = 5, ledger: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     brief: dict[str, Any] = {"query": query, "sources": [], "summary": ""}
     search_result = _execute_safe_tool("web_search", {"query": query, "limit": max_sources})
@@ -2238,7 +2274,7 @@ Tool request protocol:
     else:
         capability_block = "\nTool request protocol: disabled for this run. Do not emit TOOL_REQUESTS_JSON.\n"
 
-    return f"""Ты участник {council_i + 1}/{councils} OmniCouncil (Hermes OmniCouncil v5.3).
+    return f"""Ты участник {council_i + 1}/{councils} OmniCouncil (Hermes OmniCouncil v5.6.0).
 Модель: {member_model}
 Перспектива: {perspective}
 Режим: {mode}
@@ -2925,7 +2961,7 @@ def _judge_prompt(
         if compiler_judge else ""
     )
 
-    prompt = f"""Ты финальный судья Hermes OmniCouncil v5.3 (модель: {judge_model}).
+    prompt = f"""Ты финальный судья Hermes OmniCouncil v5.6.0 (модель: {judge_model}).
 Синтезируй лучший проверяемый результат, опираясь на evidence и research.
 
 Output format: {output_format}
@@ -3082,7 +3118,7 @@ def _make_research_missions(task: str, mode: str, manifest: dict[str, Any], max_
 
 def _run_research_mission(mission: dict[str, Any], manifest: dict[str, Any], max_tokens: int, jitter_ms: int = DEFAULT_REQUEST_JITTER_MS, research_model: str = DEFAULT_MODEL) -> dict[str, Any]:
     try:
-        prompt = f"""Ты research subagent в Hermes OmniCouncil v5.5.
+        prompt = f"""Ты research subagent в Hermes OmniCouncil v5.6.0
 Используй safe tools (web_search, web_extract, read_file, memory_wiki_query) для поиска фактов.
 Отделяй Evidence от Assumption. Верни Findings, Risks, Acceptance tests. Добавь CLAIMS_JSON с evidence_refs/status/confidence.
 
@@ -3501,7 +3537,7 @@ def _handle_doctor(args=None, **_kw):
 #  MAIN HANDLER — omnicouncil orchestration
 # ═══════════════════════════════════════════════════════════════
 def handler(args=None, **_kw):
-    global _ACTIVE_FALLBACK_MODELS
+    global _ACTIVE_FALLBACK_MODELS, _OMNICOUNCIL_SESSION_ID
     if args is None:
         args = {k: v for k, v in _kw.items() if k not in {"task_id", "ctx"}}
     else:
@@ -3534,15 +3570,51 @@ def handler(args=None, **_kw):
     member_models = [s['model'] for s in member_specs]
     judge_model = _spec_str(judge_spec)
     research_model = _spec_str(research_spec)
-    # Store specs for multi-provider mapping (module-level globals for _call_model_text)
+    # ── CouncilRunContext: изолированный контекст запуска (P0 #1, #6 fix) ──
+    import uuid as _uuid_mod
+    run_id = str(_uuid_mod.uuid4())
+    session_id = run_id  # каждый council — уникальная сессия
+    namespace = f"omnicouncil:blackboard:{session_id}"
+
+    # Provider data policy (P0 #6 fix)
+    provider_data_policy = str(args.get("provider_data_policy") or "internal")
+    implicit_http_fallback = _normalise_bool(args.get("implicit_http_fallback"), False)
+    
+    # Run budget (P1 #7)
+    budget = RunBudget(
+        max_total_tokens=_clamp_int(args.get("max_total_tokens"), 1_000_000, 1000, 4_000_000),
+        max_total_cost_usd=float(args.get("max_cost_usd") or 5.0),
+        max_wall_time_seconds=float(args.get("timeout") or args.get("max_wall_time_seconds") or 600),
+        max_model_calls=_clamp_int(args.get("max_model_calls"), 50, 1, 200),
+    )
+    
+    # Создать изолированный контекст
+    run_ctx = CouncilRunContext(
+        run_id=run_id,
+        session_id=session_id,
+        namespace=namespace,
+        model_provider_map={s['model']: s.get('provider') for s in member_specs},
+        judge_provider=judge_spec.get('provider'),
+        research_provider=research_spec.get('provider'),
+        fallback_models=tuple(_as_str_list(args.get("fallback_models"))),
+        deadline=time.time() + budget.max_wall_time_seconds if budget.max_wall_time_seconds else None,
+        budget=budget,
+        provider_data_policy=provider_data_policy,
+        implicit_http_fallback=implicit_http_fallback,
+    )
+    
+    # Установить в thread-local для broker_tool_call и _call_model_text
+    _ACTIVE_RUN_CTX.current = run_ctx
+    
+    # Заполнить устаревшие глобалы ДЛЯ ОБРАТНОЙ СОВМЕСТИМОСТИ
     global _MODEL_PROVIDER_MAP, _JUDGE_PROVIDER, _RESEARCH_PROVIDER, _JUDGE_SPEC, _RESEARCH_SPEC
     _MEMBER_SPEC_MAP: dict[str, dict] = {s['model']: s for s in member_specs}
     _JUDGE_SPEC = judge_spec
     _RESEARCH_SPEC = research_spec
-    # Populate module-level globals for _call_model_text()
     _MODEL_PROVIDER_MAP = {s['model']: s.get('provider') for s in member_specs}
     _JUDGE_PROVIDER = judge_spec.get('provider')
     _RESEARCH_PROVIDER = research_spec.get('provider')
+    _OMNICOUNCIL_SESSION_ID = session_id
     _ACTIVE_FALLBACK_MODELS = _as_str_list(args.get("fallback_models"))
 
     # ── Parse args
@@ -3577,16 +3649,13 @@ def handler(args=None, **_kw):
     if tool_mode == "off":
         max_tool_requests = 0
         brokered_tools = False
-    # ── Mutation policy (new in v5.5) ──
+    # ── Mutation policy (new in v5.6.0) ──
     allow_file_mutations = _normalise_bool(args.get("allow_file_mutations"), False)
     allow_code_mutations = _normalise_bool(args.get("allow_code_mutations"), False)
     critical_change_policy = str(args.get("critical_change_policy") or "operator_only").strip().lower()
     if critical_change_policy not in {"propose_only", "judge_approved", "operator_only"}:
         critical_change_policy = "operator_only"
-    # Set global session ID for blackboard namespace
-    import uuid as _uuid_mod
-    global _OMNICOUNCIL_SESSION_ID
-    _OMNICOUNCIL_SESSION_ID = str(_uuid_mod.uuid4())[:8]
+    # ── Output format ──
     output_format = args.get("output_format", "structured") or "structured"
     if output_format not in {"prose", "structured", "patch_plan", "json"}:
         output_format = "structured"

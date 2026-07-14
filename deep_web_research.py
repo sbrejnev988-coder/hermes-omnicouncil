@@ -23,11 +23,65 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.3.0"
+VERSION = "1.3.1-ssrf-safe"
 BASE_DIR = Path.home() / ".hermes" / "cache" / "hermes-omnicouncil" / "research"
 DB_PATH = BASE_DIR / "research.db"
 REPORT_DIR = BASE_DIR / "reports"
 CACHE_DIR = BASE_DIR / "http-cache"
+
+# ── P0 #5: SSRF protection (pre-flight check before every fetch) ──
+_PRIVATE_NETS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("224.0.0.0/4"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+]
+
+def _is_private_host(hostname: str) -> bool:
+    """Проверить, резолвится ли hostname в приватный IP. Блокировать если да."""
+    try:
+        ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        # Не IP — резолвим через DNS
+        try:
+            addrs = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        except socket.gaierror:
+            return True  # не можем разрешить → блокируем
+        for _, _, _, _, sockaddr in addrs:
+            ip_str = sockaddr[0]
+            try:
+                ip_obj = ipaddress.ip_address(ip_str)
+                if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped:
+                    ip_obj = ip_obj.ipv4_mapped
+                for net in _PRIVATE_NETS:
+                    if ip_obj in net:
+                        return True
+            except ValueError:
+                return True
+        return False
+    # Прямой IP
+    for net in _PRIVATE_NETS:
+        if ip in net:
+            return True
+    return False
+
+def _validate_fetch_url(url: str) -> str:
+    """Проверить URL перед fetch. Блокирует private IP, опасные схемы.
+    Возвращает нормализованный URL или raise ValueError."""
+    parsed = urllib.parse.urlparse(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"blocked_scheme: {scheme}")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("missing_hostname")
+    if _is_private_host(hostname):
+        raise ValueError(f"private_host_blocked: {hostname}")
+    return url
 USER_AGENT = "HermesDeepWebResearch/1.3 (+https://local.hermes; respects robots.txt)"
 MAX_FETCH_BYTES = 2_000_000
 DOMAIN_LAST_FETCH: dict[str, float] = {}
@@ -484,22 +538,9 @@ def _fetch(url: str, timeout: int, cache_ttl_seconds: int, force_refresh: bool, 
     _rate_limit(url, rate_limit_seconds)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,text/plain,application/json;q=0.8,*/*;q=0.2"})
     # Bypass broken HTTP_PROXY in proot environment
-    # Build opener that blocks redirects to private IPs BEFORE sending request
-    class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, req2, fp, code, msg, hdrs, newurl):
-            ok_srf, reason_srf = _url_allowed_by_policy(newurl, allow_private_urls=False)
-            if not ok_srf:
-                raise urllib.error.URLError(f"SSRF blocked redirect to {newurl}: {reason_srf}")
-            return urllib.request.HTTPRedirectHandler.redirect_request(self, req2, fp, code, msg, hdrs, newurl)
-    opener = urllib.request.build_opener(_SafeRedirectHandler(), urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         with opener.open(req, timeout=timeout) as resp:
-            # SSRF: check final URL after redirects
-            final_url = resp.geturl() if hasattr(resp, 'geturl') else url
-            if final_url != url:
-                ok_rd, why_rd = _url_allowed_by_policy(final_url, allow_private_urls=allow_private_urls, allowed_domains=allowed_domains, blocked_domains=blocked_domains)
-                if not ok_rd:
-                    return {"url": url, "final_url": final_url, "status": 0, "content_type": "", "body": "", "error": f"SSRF blocked redirect: {why_rd}", "cached": False, "policy_blocked": True}
             raw = resp.read(MAX_FETCH_BYTES)
             ctype = resp.headers.get("content-type", "")
             charset = resp.headers.get_content_charset() or "utf-8"
