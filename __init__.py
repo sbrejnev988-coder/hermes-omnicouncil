@@ -1,4 +1,4 @@
-"""hermes-omnicouncil v5.6.0 — multi-model agentic council with evidence/probe/prosecutor/compiler loops.
+"""hermes-omnicouncil v5.5.0 — multi-model agentic council with evidence/probe/prosecutor/compiler loops.
 
 Features:
 - Swappable models (model/member_models/judge_model/research_model — any provider via provider:model syntax)
@@ -27,7 +27,7 @@ from typing import Any
 
 _EVEY_UTILS_PATH = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "evey_utils.py")
 
-# ── call_hermes_model: always available (v5.6.0 multi-provider) ──
+# ── call_hermes_model: always available (v5.4 multi-provider) ──
 def call_hermes_model(
     prompt: str,
     *,
@@ -44,10 +44,35 @@ def call_hermes_model(
     Requires plugins.entries.hermes-omnicouncil.llm.allow_provider_override=true
     and allow_model_override=true in ~/.hermes/config.yaml.
     Falls back to HTTP for standalone/smoke-test use.
+    
+    P0 #6: Security checks on BOTH code paths (evey_utils exists AND not).
     """
+    # ── P0 #6: Provider data policy + cancellation + budget (ALL paths) ──
+    run_ctx: Any = _ACTIVE_RUN_CTX.get()
+    if run_ctx is not None:
+        effective_provider = provider or (run_ctx.model_provider_map.get(model or "", None))
+        if effective_provider:
+            policy = PROVIDER_DATA_POLICIES.get(run_ctx.provider_data_policy, PROVIDER_DATA_POLICIES["internal"])
+            allowed = policy.get("allowed_providers", ["local"])
+            if effective_provider not in allowed and effective_provider != "local":
+                if not run_ctx.implicit_http_fallback:
+                    return {
+                        "error": f"provider_blocked_by_data_policy: {effective_provider} not in {allowed} (policy={run_ctx.provider_data_policy})",
+                        "fix": "Set implicit_http_fallback=true or adjust provider_data_policy",
+                    }
+        if run_ctx.is_cancelled():
+            return {"error": "council_cancelled"}
+        if run_ctx.deadline and time.time() > run_ctx.deadline:
+            run_ctx.cancel()
+            return {"error": "council_timed_out"}
+        if run_ctx.budget and not run_ctx.budget.can_call_model():
+            return {"error": "budget_exhausted"}
+    
     ctx = _RUNTIME_CTX
     if ctx is None or not hasattr(ctx, "llm"):
-        # Standalone/smoke-test: no Hermes runtime available — use HTTP fallback
+        # P0 #6: HTTP fallback must respect policy
+        if run_ctx is not None and not run_ctx.implicit_http_fallback:
+            return {"error": "implicit_http_fallback_disabled"}
         return _call_model_http(prompt, model or DEFAULT_MODEL, max_tokens, temperature, retries, timeout)
     for attempt in range(max(1, retries + 1)):
         try:
@@ -109,6 +134,9 @@ def call_hermes_model(
                 logger.warning("call_hermes_model(%s/%s) failed: %s", provider, model, exc)
             else:
                 time.sleep(min(2 ** attempt, 8))
+    # P0 #6: HTTP fallback after retries must respect policy
+    if run_ctx is not None and not run_ctx.implicit_http_fallback:
+        return {"error": "implicit_http_fallback_disabled"}
     return _call_model_http(prompt, model or DEFAULT_MODEL, max_tokens, temperature, 1, timeout)
 
 def _call_model_http(prompt: str, model: str, max_tokens: int, temperature: float, retries: int, timeout: int) -> dict[str, Any] | None:
@@ -167,7 +195,7 @@ else:
         Returns: {content, provider, model, usage: {input_tokens, output_tokens, total_tokens, cost_usd}}
         """
         # ── P0 #6: Provider data policy check ──
-        run_ctx: Any = getattr(_ACTIVE_RUN_CTX, "current", None)
+        run_ctx: Any = _ACTIVE_RUN_CTX.get()
         if run_ctx is not None:
             effective_provider = provider or (run_ctx.model_provider_map.get(model or "", None))
             if effective_provider:
@@ -311,7 +339,7 @@ _deep_spec.loader.exec_module(_deep_web_research)
 # ═══════════════════════════════════════════════════════════════════════
 #  Model routing — any provider+model pair Hermes can call
 # ═══════════════════════════════════════════════════════════════════════
-VERSION = "5.6.0-council-safe"
+VERSION = "5.5.0-council-safe"
 
 # ── Model ref parser ──────────────────────────────────────────────────
 def parse_model_ref(ref: str) -> "tuple[str|None, str]":
@@ -595,7 +623,7 @@ STATIC_TOOLSETS = {
 SCHEMA = {
     "name": "hermes_omnicouncil",
     "description": (
-        "Hermes OmniCouncil v5.6.0: multi-model agentic council with shared blackboard, message rounds, "
+        "Hermes OmniCouncil v5.5.0: multi-model agentic council with shared blackboard, message rounds, "
         "safe memory/web/file tools, swappable models, web_research_brief, and deep_web_crawl. "
         "Agents collaborate via blackboard notes, peer review, and directed messages. "
         "Adds Evidence Ledger, Plan→Probe→Decide, Prosecutor, forced dissent, lesson extraction, and Judge-as-Compiler."
@@ -1321,8 +1349,8 @@ def broker_tool_call(agent: str, tool_name: str, args: dict[str, Any]) -> dict[s
             "reason": "Council members may read files/memory and write blackboard only. Code/file mutations require executor approval.",
         }
 
-    # Получить CouncilRunContext из thread-local (P0 #1 fix)
-    run_ctx: CouncilRunContext | None = getattr(_ACTIVE_RUN_CTX, "current", None)
+    # Получить CouncilRunContext из ContextVar (P0 #1 fix — наследуется в workers)
+    run_ctx: CouncilRunContext | None = _ACTIVE_RUN_CTX.get()
 
     # ── P1 #8: Cancellation check for tool calls ──
     if run_ctx is not None and run_ctx.is_cancelled():
@@ -1339,9 +1367,7 @@ def broker_tool_call(agent: str, tool_name: str, args: dict[str, Any]) -> dict[s
     }:
         if run_ctx is not None:
             args = force_blackboard_namespace(run_ctx, agent, tool_name, args)
-        else:
-            # Fallback: используем устаревшие глобалы (для тестов без CouncilRunContext)
-            args = force_blackboard_namespace_legacy(agent, tool_name, args)
+        # P0 #2 fix: НЕТ legacy fallback. Без CouncilRunContext — ошибка.
 
     # Enforce readonly workspace policy
     if tool_name in {"read_file", "search_files"}:
@@ -1410,9 +1436,12 @@ from .council_context import (
     PROVIDER_DATA_POLICIES,
 )
 
-# Thread-local fallback для обратной совместимости (_call_model_text без явного ctx)
-import threading as _threading
-_ACTIVE_RUN_CTX: _threading.local = _threading.local()
+# P0 #1 FIX: contextvars.ContextVar вместо threading.local()
+# ContextVar НАСЛЕДУЕТСЯ в ThreadPoolExecutor workers (в отличие от threading.local)
+import contextvars as _contextvars
+_ACTIVE_RUN_CTX: _contextvars.ContextVar = _contextvars.ContextVar(
+    'omnicouncil_run_ctx', default=None
+)
 
 # Deprecated — оставлены для обратной совместимости, НЕ используются новым кодом
 _OMNICOUNCIL_SESSION_ID: str | None = None
@@ -2274,7 +2303,7 @@ Tool request protocol:
     else:
         capability_block = "\nTool request protocol: disabled for this run. Do not emit TOOL_REQUESTS_JSON.\n"
 
-    return f"""Ты участник {council_i + 1}/{councils} OmniCouncil (Hermes OmniCouncil v5.6.0).
+    return f"""Ты участник {council_i + 1}/{councils} OmniCouncil (Hermes OmniCouncil v5.3).
 Модель: {member_model}
 Перспектива: {perspective}
 Режим: {mode}
@@ -2760,8 +2789,10 @@ def _run_collaboration(
     for round_no in range(1, rounds + 1):
         worker_count = max(1, min(len(successful), max_workers or DEFAULT_MAX_COLLABORATION_WORKERS))
         with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
+            _submit_ctx = _contextvars.copy_context()
             future_map = {
                 pool.submit(
+                    _submit_ctx.run,
                     _call_collaboration_member, task, context, mode, member,
                     answers, transcript, round_no, max_tokens, manifest, ledger,
                     research_reports, tool_requests, max_tool_requests, timeout,
@@ -2811,8 +2842,10 @@ def _run_message_rounds(
         # Каждый агент видит все предыдущие сообщения
         worker_count = max(1, min(len(successful), max_workers or DEFAULT_MAX_COLLABORATION_WORKERS))
         with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
+            _submit_ctx = _contextvars.copy_context()
             future_map = {
                 pool.submit(
+                    _submit_ctx.run,
                     _call_message_round_member, task, context, mode, member,
                     answers, all_messages, round_no, max_tokens, manifest, ledger,
                     tool_requests, max_tool_requests, timeout, retries, jitter_ms,
@@ -2961,7 +2994,7 @@ def _judge_prompt(
         if compiler_judge else ""
     )
 
-    prompt = f"""Ты финальный судья Hermes OmniCouncil v5.6.0 (модель: {judge_model}).
+    prompt = f"""Ты финальный судья Hermes OmniCouncil v5.3 (модель: {judge_model}).
 Синтезируй лучший проверяемый результат, опираясь на evidence и research.
 
 Output format: {output_format}
@@ -3118,7 +3151,7 @@ def _make_research_missions(task: str, mode: str, manifest: dict[str, Any], max_
 
 def _run_research_mission(mission: dict[str, Any], manifest: dict[str, Any], max_tokens: int, jitter_ms: int = DEFAULT_REQUEST_JITTER_MS, research_model: str = DEFAULT_MODEL) -> dict[str, Any]:
     try:
-        prompt = f"""Ты research subagent в Hermes OmniCouncil v5.6.0
+        prompt = f"""Ты research subagent в Hermes OmniCouncil v5.5.
 Используй safe tools (web_search, web_extract, read_file, memory_wiki_query) для поиска фактов.
 Отделяй Evidence от Assumption. Верни Findings, Risks, Acceptance tests. Добавь CLAIMS_JSON с evidence_refs/status/confidence.
 
@@ -3604,7 +3637,7 @@ def handler(args=None, **_kw):
     )
     
     # Установить в thread-local для broker_tool_call и _call_model_text
-    _ACTIVE_RUN_CTX.current = run_ctx
+    _ACTIVE_RUN_CTX.set(run_ctx)
     
     # Заполнить устаревшие глобалы ДЛЯ ОБРАТНОЙ СОВМЕСТИМОСТИ
     global _MODEL_PROVIDER_MAP, _JUDGE_PROVIDER, _RESEARCH_PROVIDER, _JUDGE_SPEC, _RESEARCH_SPEC
@@ -3649,7 +3682,7 @@ def handler(args=None, **_kw):
     if tool_mode == "off":
         max_tool_requests = 0
         brokered_tools = False
-    # ── Mutation policy (new in v5.6.0) ──
+    # ── Mutation policy (new in v5.5) ──
     allow_file_mutations = _normalise_bool(args.get("allow_file_mutations"), False)
     allow_code_mutations = _normalise_bool(args.get("allow_code_mutations"), False)
     critical_change_policy = str(args.get("critical_change_policy") or "operator_only").strip().lower()
@@ -3784,8 +3817,10 @@ def handler(args=None, **_kw):
     primary_workers = max(1, min(total_members, max_member_workers))
     blackboard: dict[str, Any] = {"task": task, "round": 0, "facts": [], "open_questions": [], "notes": {}}
     with concurrent.futures.ThreadPoolExecutor(max_workers=primary_workers) as pool:
+        _submit_ctx = _contextvars.copy_context()
         future_map = {
             pool.submit(
+                _submit_ctx.run,
                 _call_member, task, context, mode, ci, mi, max_tokens, manifest, ledger,
                 output_format, max_tool_requests, perspectives, councils, model_timeout,
                 member_retries, decision_policy, red_team, request_jitter_ms,
