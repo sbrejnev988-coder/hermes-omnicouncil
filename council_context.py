@@ -51,6 +51,26 @@ class CouncilRunContext:
         self._cancellation_token.set()
 
 
+# ── Context manager for safe setup/teardown ─────────────────────────
+import contextlib as _contextlib_module
+
+@_contextlib_module.contextmanager
+def _run_context(ctx_var, run_ctx: CouncilRunContext):
+    """P0 #1: try/finally контекстный менеджер для ContextVar.
+    
+    Использование:
+        with _run_context(_ACTIVE_RUN_CTX, run_ctx):
+            # council execution
+    
+    Гарантирует reset даже при исключениях и ранних return.
+    """
+    token = ctx_var.set(run_ctx)
+    try:
+        yield
+    finally:
+        ctx_var.reset(token)
+
+
 # ── RunBudget ────────────────────────────────────────────────────────
 @dataclass
 class RunBudget:

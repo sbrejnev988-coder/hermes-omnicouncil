@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""Smoke tests for hermes-omnicouncil v5.5.0 — council-safe multi-provider council."""
+"""Smoke tests for hermes-omnicouncil v5.6.1 — council-safe multi-provider council."""
 from __future__ import annotations
 
 import importlib.util
 import json
-import sys
 from pathlib import Path
 
 PLUGIN = Path(__file__).resolve().parents[1] / "__init__.py"
 spec = importlib.util.spec_from_file_location(
     "hermes_omnicouncil",
-    str(PLUGIN),
+    PLUGIN,
     submodule_search_locations=[str(PLUGIN.parent)],
 )
 mod = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = mod
+import sys
+sys.modules["hermes_omnicouncil"] = mod
 spec.loader.exec_module(mod)
 
 # ═══════════════════════════════════════════════════════════════
 # 1. Version & constants
 # ═══════════════════════════════════════════════════════════════
-assert mod.VERSION == "5.5.0-council-safe", f"VERSION={mod.VERSION}"
+assert mod.VERSION == "5.6.1-council-safe", f"VERSION={mod.VERSION}"
 assert mod.DEFAULT_MAX_TOKENS == 384000
 assert mod.DEFAULT_JUDGE_MAX_TOKENS == 384000
 assert mod.MAX_CONTEXT_CHARS == 1_000_000
@@ -97,13 +97,24 @@ for tool in mod.COUNCIL_DENIED_TOOLS:
     assert r.get("error") == "tool_denied", f"{tool}: {r}"
 
 # ═══════════════════════════════════════════════════════════════
-# 7. force_blackboard_namespace
+# 7. force_blackboard_namespace (v5.6.1: CouncilRunContext required)
 # ═══════════════════════════════════════════════════════════════
-mod._OMNICOUNCIL_SESSION_ID = "test_session_42"
-args = mod.force_blackboard_namespace("critic@openrouter:claude", "memory_wiki_add_claim", {"claim": "test"})
+run_ctx = mod.CouncilRunContext(
+    run_id="test_run_smoke",
+    session_id="test_session_42",
+    namespace="omnicouncil:blackboard:test_session_42",
+    model_provider_map={"deepseek-v4-pro": "deepseekproxy"},
+)
+args = mod.force_blackboard_namespace(run_ctx, "critic", "memory_wiki_add_claim", {"claim": "test"})
 assert args["topic"] == "omnicouncil:blackboard:test_session_42"
-assert args["source"] == "omnicouncil:agent:critic@openrouter:claude"
+assert args["source"] == "omnicouncil:agent:critic"
 assert args["require_firewall"] is True
+# Verify model-supplied values are stripped
+args2 = mod.force_blackboard_namespace(run_ctx, "attacker", "memory_wiki_add_claim",
+    {"claim": "malicious", "session_id": "hijacked", "topic": "private:secrets", "source": "operator"})
+assert args2["topic"] == "omnicouncil:blackboard:test_session_42"
+assert args2["source"] == "omnicouncil:agent:attacker"
+assert "session_id" not in args2  # stripped!
 
 # ═══════════════════════════════════════════════════════════════
 # 8. Ephemeral blackboard

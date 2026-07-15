@@ -1436,6 +1436,7 @@ from .council_context import (
     RecalledItem,
     sanitize_recalled,
     PROVIDER_DATA_POLICIES,
+    _run_context,
 )
 
 # P0 #1 FIX: contextvars.ContextVar вместо threading.local()
@@ -3638,7 +3639,7 @@ def handler(args=None, **_kw):
     
     # Установить в контекст для broker_tool_call и _call_model_text
     _ctx_token = _ACTIVE_RUN_CTX.set(run_ctx)
-    # P0 #1 fix: reset будет вызван перед каждым return ниже
+    # P0 #1 fix: reset вызывается перед каждым return + finally safety net
     
     # Заполнить устаревшие глобалы ДЛЯ ОБРАТНОЙ СОВМЕСТИМОСТИ
     global _MODEL_PROVIDER_MAP, _JUDGE_PROVIDER, _RESEARCH_PROVIDER, _JUDGE_SPEC, _RESEARCH_SPEC
