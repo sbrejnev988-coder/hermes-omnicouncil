@@ -1366,6 +1366,18 @@ def broker_tool_call(agent: str, tool_name: str, args: dict[str, Any]) -> dict[s
     # Получить CouncilRunContext из ContextVar (P0 #1 fix — наследуется в workers)
     run_ctx: CouncilRunContext | None = _ACTIVE_RUN_CTX.get()
 
+    # P0 fix: mutation tools MUST have CouncilRunContext — fail-closed
+    _MEMORY_MUTATION_TOOLS = {
+        "memory_wiki_add_claim", "memory_wiki_add_decision", "memory_wiki_add_evidence",
+        "memory_wiki_add_entity", "memory_wiki_add_relation", "memory_wiki_update_claim",
+        "memory_wiki_post_task", "memory_wiki_add_task_capsule",
+    }
+    if run_ctx is None and tool_name in _MEMORY_MUTATION_TOOLS:
+        return {
+            "ok": False, "error": "missing_council_run_context",
+            "detail": "Durable memory mutations require an active council context. This tool call bypassed context propagation.",
+        }
+
     # ── P1 #8: Cancellation check for tool calls ──
     if run_ctx is not None and run_ctx.is_cancelled():
         return {"ok": False, "error": "council_cancelled", "detail": "Tool call blocked: council is cancelled"}
@@ -1527,7 +1539,7 @@ def _execute_tool_requests(tool_requests: list[dict[str, Any]], ledger: list[dic
     worker_count = max(1, min(len(pending), max_workers or 4))
     completed = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
-        future_map = {pool.submit(run, req): req for req in pending}
+        future_map = {pool.submit(_contextvars.copy_context().run, run, req): req for req in pending}
         for future in concurrent.futures.as_completed(future_map):
             req = future_map[future]
             try:
@@ -3191,7 +3203,7 @@ def _run_research_missions(
     worker_count = max(1, min(len(missions), max_workers or DEFAULT_MAX_RESEARCH_WORKERS))
     results: list[dict[str, Any]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
-        future_map = {pool.submit(_run_research_mission, m, manifest, max_tokens, jitter_ms, research_model): m for m in missions}
+        future_map = {pool.submit(_contextvars.copy_context().run, _run_research_mission, m, manifest, max_tokens, jitter_ms, research_model): m for m in missions}
         for future in concurrent.futures.as_completed(future_map):
             mission = future_map[future]
             try:
