@@ -84,6 +84,9 @@ class RunBudget:
     max_failed_calls: int = 10
     reserved_judge_tokens: int = 50_000
 
+    # P1 fix: threading.Lock для атомарных операций бюджета
+    _lock: Any = field(default_factory=lambda: __import__('threading').Lock(), repr=False)
+
     # Расходуемые счётчики
     spent_input_tokens: int = 0
     spent_output_tokens: int = 0
@@ -113,6 +116,25 @@ class RunBudget:
     def remaining_seconds(self) -> float:
         return max(0.0, self.max_wall_time_seconds - self.elapsed_seconds)
 
+    def try_reserve_model_call(self, estimated_tokens: int = 0, estimated_cost: float = 0.0) -> bool:
+        """P1 fix: атомарная reservation. Возвращает True если вызов разрешён."""
+        with self._lock:
+            if self.model_calls >= self.max_model_calls:
+                return False
+            if self.spent_total_tokens + estimated_tokens + self.reserved_judge_tokens > self.max_total_tokens:
+                return False
+            if self.spent_cost_usd + estimated_cost > self.max_total_cost_usd:
+                return False
+            if self.elapsed_seconds > self.max_wall_time_seconds:
+                return False
+            if self.failed_calls >= self.max_failed_calls:
+                return False
+            # Reservation: сразу резервируем токены и вызов
+            self.model_calls += 1
+            self.spent_input_tokens += estimated_tokens
+            self.spent_cost_usd += estimated_cost
+            return True
+
     def can_call_model(self, estimated_tokens: int = 0) -> bool:
         """Можно ли сделать ещё один model call с учётом резерва judge."""
         if self.model_calls >= self.max_model_calls:
@@ -122,6 +144,8 @@ class RunBudget:
         if self.elapsed_seconds > self.max_wall_time_seconds:
             return False
         if self.failed_calls >= self.max_failed_calls:
+            return False
+        if self.spent_cost_usd >= self.max_total_cost_usd:
             return False
         return True
 

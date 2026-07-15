@@ -239,7 +239,7 @@ else:
             return {"error": "council_timed_out", "detail": f"Deadline {run_ctx.deadline} exceeded"}
         
         # ── P1 #7: Budget check ──
-        if run_ctx is not None and run_ctx.budget and not run_ctx.budget.can_call_model():
+        if run_ctx is not None and run_ctx.budget and not run_ctx.budget.try_reserve_model_call():
             return {"error": "budget_exhausted", "detail": f"Tokens: {run_ctx.budget.spent_total_tokens}/{run_ctx.budget.max_total_tokens}"}
         
         ctx = _RUNTIME_CTX
