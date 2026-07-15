@@ -536,17 +536,39 @@ def _fetch(url: str, timeout: int, cache_ttl_seconds: int, force_refresh: bool, 
         if not allowed:
             return {"url": url, "status": 0, "content_type": "", "body": "", "error": f"blocked_by_robots: {robots_url}", "cached": False, "robots_blocked": True}
     _rate_limit(url, rate_limit_seconds)
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,text/plain,application/json;q=0.8,*/*;q=0.2"})
-    # Bypass broken HTTP_PROXY in proot environment
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    # ── P0 #5: SSRF-safe HTTP (DNS pinning, peer IP verify, manual redirects) ──
     try:
-        with opener.open(req, timeout=timeout) as resp:
-            raw = resp.read(MAX_FETCH_BYTES)
-            ctype = resp.headers.get("content-type", "")
-            charset = resp.headers.get_content_charset() or "utf-8"
-            body = raw.decode(charset, "replace")
-            status = getattr(resp, "status", 200)
-            error = ""
+        from .ssrf_safe_http import safe_http_request
+        status, raw_bytes, resp_headers = safe_http_request(
+            url,
+            timeout=timeout,
+            max_body_bytes=MAX_FETCH_BYTES,
+            max_redirects=5,
+        )
+        ctype = resp_headers.get("content-type", "")
+        # Determine charset from content-type header
+        charset = "utf-8"
+        if "charset=" in ctype:
+            try:
+                charset = ctype.split("charset=")[-1].split(";")[0].strip()
+            except Exception:
+                pass
+        body = raw_bytes.decode(charset, "replace")
+        error = ""
+    except ImportError:
+        # Fallback: original urllib (should not happen in normal deployment)
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,text/plain,application/json;q=0.8,*/*;q=0.2"})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                raw = resp.read(MAX_FETCH_BYTES)
+                ctype = resp.headers.get("content-type", "")
+                charset = resp.headers.get_content_charset() or "utf-8"
+                body = raw.decode(charset, "replace")
+                status = getattr(resp, "status", 200)
+                error = ""
+        except Exception as exc:
+            status, ctype, body, error = 0, "", "", _redact(str(exc))[:1000]
     except Exception as exc:
         status, ctype, body, error = 0, "", "", _redact(str(exc))[:1000]
     con.execute(

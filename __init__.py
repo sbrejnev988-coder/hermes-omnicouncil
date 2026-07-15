@@ -91,6 +91,12 @@ def call_hermes_model(
                 actual_provider = getattr(result, "provider", provider or "hermes")
                 actual_model = getattr(result, "model", model or "active")
                 usage = getattr(result, "usage", None)
+                # P1 #7: Record model call in budget
+                if run_ctx is not None and run_ctx.budget:
+                    input_tokens = getattr(usage, "input_tokens", 0) if usage else 0
+                    output_tokens = getattr(usage, "output_tokens", 0) if usage else 0
+                    cost = getattr(usage, "cost_usd", 0.0) if usage else 0.0
+                    run_ctx.budget.record_model_call(input_tokens, output_tokens, float(cost or 0))
                 return {
                     "content": content.strip(), "provider": actual_provider, "model": actual_model,
                     "usage": {"input_tokens": getattr(usage, "input_tokens", 0) if usage else 0,
@@ -241,6 +247,12 @@ else:
                     actual_provider = getattr(result, "provider", provider or "hermes")
                     actual_model = getattr(result, "model", model or "active")
                     usage = getattr(result, "usage", None)
+                    # P1 #7: Record model call in budget
+                    if run_ctx is not None and run_ctx.budget:
+                        input_tokens = getattr(usage, "input_tokens", 0) if usage else 0
+                        output_tokens = getattr(usage, "output_tokens", 0) if usage else 0
+                        cost = getattr(usage, "cost_usd", 0.0) if usage else 0.0
+                        run_ctx.budget.record_model_call(input_tokens, output_tokens, float(cost or 0))
                     return {
                         "content": content.strip(),
                         "provider": actual_provider,
