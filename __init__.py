@@ -1669,10 +1669,17 @@ def _scan_skills(ledger: list[dict[str, Any]], selected: list[str] | None = None
 
 
 def _scan_mcp(ledger: list[dict[str, Any]]) -> dict[str, Any]:
-    candidates = [Path.home() / ".hermes" / "config.yaml", Path("/root/.hermes/config.yaml")]
+    candidates = [_profile_home() / "config.yaml", Path.home() / ".hermes" / "config.yaml", Path("/root/.hermes/config.yaml")]
     found: list[dict[str, Any]] = []
+    _seen_cfg: set[str] = set()
     for cfg in candidates:
-        if not cfg.exists():
+        if str(cfg) in _seen_cfg:
+            continue
+        _seen_cfg.add(str(cfg))
+        try:
+            if not cfg.exists():
+                continue
+        except OSError:
             continue
         text = _read_text_safe(cfg, 120_000)
         if "mcp_servers" not in text:
