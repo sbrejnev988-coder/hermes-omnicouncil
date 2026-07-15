@@ -52,7 +52,15 @@ def call_hermes_model(
     run_ctx: Any = _ACTIVE_RUN_CTX.get()
     if run_ctx is not None:
         effective_provider = provider or (run_ctx.model_provider_map.get(model or "", None))
-        if effective_provider:
+        # P0 fix: if provider unresolved AND policy is confidential → fail-closed
+        if not effective_provider:
+            policy = PROVIDER_DATA_POLICIES.get(run_ctx.provider_data_policy, PROVIDER_DATA_POLICIES["internal"])
+            if policy.get("allow_implicit_fallback") is False:
+                return {
+                    "error": "provider_unresolved_fail_closed",
+                    "detail": f"Policy '{run_ctx.provider_data_policy}' requires explicit provider. model={model} has no mapped provider.",
+                }
+        elif effective_provider:
             policy = PROVIDER_DATA_POLICIES.get(run_ctx.provider_data_policy, PROVIDER_DATA_POLICIES["internal"])
             allowed = policy.get("allowed_providers", ["local"])
             if effective_provider not in allowed and effective_provider != "local":
@@ -205,7 +213,15 @@ else:
         run_ctx: Any = _ACTIVE_RUN_CTX.get()
         if run_ctx is not None:
             effective_provider = provider or (run_ctx.model_provider_map.get(model or "", None))
-            if effective_provider:
+            # P0 fix: fail-closed when provider unresolved under restrictive policy
+            if not effective_provider:
+                policy = PROVIDER_DATA_POLICIES.get(run_ctx.provider_data_policy, PROVIDER_DATA_POLICIES["internal"])
+                if policy.get("allow_implicit_fallback") is False:
+                    return {
+                        "error": "provider_unresolved_fail_closed",
+                        "detail": f"Policy '{run_ctx.provider_data_policy}' requires explicit provider.",
+                    }
+            elif effective_provider:
                 policy = PROVIDER_DATA_POLICIES.get(run_ctx.provider_data_policy, PROVIDER_DATA_POLICIES["internal"])
                 allowed = policy.get("allowed_providers", ["local"])
                 if effective_provider not in allowed and effective_provider != "local":
