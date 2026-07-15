@@ -18,6 +18,7 @@ import inspect
 import importlib.util as _iu
 import json
 import logging
+import math
 import os as _os
 import random
 import re
@@ -339,7 +340,7 @@ _deep_spec.loader.exec_module(_deep_web_research)
 # ═══════════════════════════════════════════════════════════════════════
 #  Model routing — any provider+model pair Hermes can call
 # ═══════════════════════════════════════════════════════════════════════
-VERSION = "5.5.0-council-safe"
+VERSION = "5.6.1-council-safe"
 
 # ── Model ref parser ──────────────────────────────────────────────────
 def parse_model_ref(ref: str) -> "tuple[str|None, str]":
@@ -436,7 +437,8 @@ MAX_MEMORY_CONTEXT_CHARS = 30_000
 DEFAULT_MAX_MEMBER_WORKERS = 8
 DEFAULT_MAX_COLLABORATION_WORKERS = 6
 DEFAULT_MAX_RESEARCH_WORKERS = 4
-DEFAULT_MIN_SUCCESSFUL_MEMBERS = 1
+DEFAULT_MIN_SUCCESSFUL_MEMBERS = 1  # будет пересчитан динамически (60% quorum)
+DEFAULT_QUORUM_RATIO = 0.6  # P0 fix: 60% участников должны ответить
 DEFAULT_REQUEST_JITTER_MS = 5500
 MAX_REQUEST_JITTER_MS = 30_000
 
@@ -2789,10 +2791,9 @@ def _run_collaboration(
     for round_no in range(1, rounds + 1):
         worker_count = max(1, min(len(successful), max_workers or DEFAULT_MAX_COLLABORATION_WORKERS))
         with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
-            _submit_ctx = _contextvars.copy_context()
             future_map = {
                 pool.submit(
-                    _submit_ctx.run,
+                    _contextvars.copy_context().run,
                     _call_collaboration_member, task, context, mode, member,
                     answers, transcript, round_no, max_tokens, manifest, ledger,
                     research_reports, tool_requests, max_tool_requests, timeout,
@@ -2842,10 +2843,9 @@ def _run_message_rounds(
         # Каждый агент видит все предыдущие сообщения
         worker_count = max(1, min(len(successful), max_workers or DEFAULT_MAX_COLLABORATION_WORKERS))
         with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
-            _submit_ctx = _contextvars.copy_context()
             future_map = {
                 pool.submit(
-                    _submit_ctx.run,
+                    _contextvars.copy_context().run,
                     _call_message_round_member, task, context, mode, member,
                     answers, all_messages, round_no, max_tokens, manifest, ledger,
                     tool_requests, max_tool_requests, timeout, retries, jitter_ms,
@@ -3636,8 +3636,9 @@ def handler(args=None, **_kw):
         implicit_http_fallback=implicit_http_fallback,
     )
     
-    # Установить в thread-local для broker_tool_call и _call_model_text
-    _ACTIVE_RUN_CTX.set(run_ctx)
+    # Установить в контекст для broker_tool_call и _call_model_text
+    _ctx_token = _ACTIVE_RUN_CTX.set(run_ctx)
+    # P0 #1 fix: reset будет вызван перед каждым return ниже
     
     # Заполнить устаревшие глобалы ДЛЯ ОБРАТНОЙ СОВМЕСТИМОСТИ
     global _MODEL_PROVIDER_MAP, _JUDGE_PROVIDER, _RESEARCH_PROVIDER, _JUDGE_SPEC, _RESEARCH_SPEC
@@ -3715,7 +3716,11 @@ def handler(args=None, **_kw):
     max_member_workers = _clamp_int(args.get("max_member_workers"), DEFAULT_MAX_MEMBER_WORKERS, 1, MAX_COUNCILS * MAX_MEMBERS_PER_COUNCIL)
     max_collaboration_workers = _clamp_int(args.get("max_collaboration_workers"), DEFAULT_MAX_COLLABORATION_WORKERS, 1, MAX_COUNCILS * MAX_MEMBERS_PER_COUNCIL)
     max_research_workers = _clamp_int(args.get("max_research_workers"), DEFAULT_MAX_RESEARCH_WORKERS, 1, 16)
-    min_successful_members = _clamp_int(args.get("min_successful_members"), DEFAULT_MIN_SUCCESSFUL_MEMBERS, 0, total_members)
+    min_successful_members = _clamp_int(
+        args.get("min_successful_members"),
+        max(1, int(math.ceil(total_members * DEFAULT_QUORUM_RATIO))),  # P0 fix: dynamic 60% quorum
+        0, total_members,
+    )
 
     context = _bounded_context(context)
     started = time.time()
@@ -3729,6 +3734,7 @@ def handler(args=None, **_kw):
 
     if dry_run:
         estimate = _estimate_budget(args, total_members, collaboration_rounds, message_rounds, research_missions, max_research_agents, self_review_round, plan_probe_decide, prosecutor_round, dissent_required)
+        _ACTIVE_RUN_CTX.reset(_ctx_token)
         return _json({
             "status": "dry_run",
             "tool": "hermes_omnicouncil",
@@ -3782,6 +3788,7 @@ def handler(args=None, **_kw):
         try:
             cached = json.loads(cache_file.read_text(encoding="utf-8"))
             cached["cached"] = True
+            _ACTIVE_RUN_CTX.reset(_ctx_token)
             return _json(cached)
         except Exception:
             pass
@@ -3817,10 +3824,9 @@ def handler(args=None, **_kw):
     primary_workers = max(1, min(total_members, max_member_workers))
     blackboard: dict[str, Any] = {"task": task, "round": 0, "facts": [], "open_questions": [], "notes": {}}
     with concurrent.futures.ThreadPoolExecutor(max_workers=primary_workers) as pool:
-        _submit_ctx = _contextvars.copy_context()
         future_map = {
             pool.submit(
-                _submit_ctx.run,
+                _contextvars.copy_context().run,
                 _call_member, task, context, mode, ci, mi, max_tokens, manifest, ledger,
                 output_format, max_tool_requests, perspectives, councils, model_timeout,
                 member_retries, decision_policy, red_team, request_jitter_ms,
@@ -4072,6 +4078,7 @@ def handler(args=None, **_kw):
         _write_json_atomic(cache_file, result)
     except Exception:
         pass
+    _ACTIVE_RUN_CTX.reset(_ctx_token)
     return _json(result)
 
 
