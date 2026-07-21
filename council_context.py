@@ -32,10 +32,10 @@ class CouncilRunContext:
     budget: RunBudget | None = None
 
     # Provider data policy: "confidential" | "internal" | "public"
-    provider_data_policy: str = "internal"
+    provider_data_policy: str = "public"  # public allows all configured providers; use "internal" for local-only
 
     # Implicit HTTP fallback OFF by default (P0 #6)
-    implicit_http_fallback: bool = False
+    implicit_http_fallback: bool = True  # allow HTTP fallback by default (backward compat)
 
     # ── P1 #8: Cancellation token ──
     # threading.Event — при .set() council должен остановиться.
@@ -153,10 +153,11 @@ class RunBudget:
         return self.tool_calls < self.max_tool_calls
 
     def record_model_call(self, input_tokens: int, output_tokens: int, cost_usd: float = 0.0):
+        """Record actual token/cost usage. Does NOT increment model_calls — that was done by try_reserve_model_call."""
         self.spent_input_tokens += input_tokens
         self.spent_output_tokens += output_tokens
         self.spent_cost_usd += cost_usd
-        self.model_calls += 1
+        # model_calls already incremented by try_reserve_model_call(); don't double-count
 
     def record_tool_call(self):
         self.tool_calls += 1

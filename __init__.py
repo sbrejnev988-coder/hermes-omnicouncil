@@ -54,6 +54,7 @@ def call_hermes_model(
         effective_provider = provider or (run_ctx.model_provider_map.get(model or "", None))
         # P0 fix: if provider unresolved AND policy is confidential → fail-closed
         if not effective_provider:
+            effective_provider = "deepseekproxy"  # Force default provider for custom proxy
             policy = PROVIDER_DATA_POLICIES.get(run_ctx.provider_data_policy, PROVIDER_DATA_POLICIES["internal"])
             if policy.get("allow_implicit_fallback") is False:
                 return {
@@ -215,6 +216,7 @@ else:
             effective_provider = provider or (run_ctx.model_provider_map.get(model or "", None))
             # P0 fix: fail-closed when provider unresolved under restrictive policy
             if not effective_provider:
+                effective_provider = "deepseekproxy"  # Force default provider for custom proxy
                 policy = PROVIDER_DATA_POLICIES.get(run_ctx.provider_data_policy, PROVIDER_DATA_POLICIES["internal"])
                 if policy.get("allow_implicit_fallback") is False:
                     return {
@@ -677,9 +679,16 @@ SCHEMA = {
             "decision_policy": {"type": "string", "enum": ["judge", "majority", "consensus", "risk_weighted"], "default": "judge"},
             "red_team": {"type": "boolean", "default": False},
             "auto_scale": {"type": "boolean", "default": False},
+            "dry_run": {"type": "boolean", "default": False, "description": "Return budget/latency estimate and resolved orchestration plan without model calls."},
             "max_tokens": {"type": "integer", "default": DEFAULT_MAX_TOKENS},
             "judge_max_tokens": {"type": "integer", "default": DEFAULT_JUDGE_MAX_TOKENS},
             "use_cache": {"type": "boolean", "default": True},
+            "provider_data_policy": {"type": "string", "enum": ["confidential", "internal", "public"], "default": "public", "description": "Data policy for provider routing: confidential=local only, internal=local+trusted proxy, public=any configured provider."},
+            "implicit_http_fallback": {"type": "boolean", "default": true, "description": "Allow implicit HTTP provider fallback (backward compat)."},
+            "max_total_tokens": {"type": "integer", "default": 1_000_000, "description": "Total token budget for entire council run."},
+            "max_cost_usd": {"type": "number", "default": 5.0, "description": "Total cost budget (USD)."},
+            "max_wall_time_seconds": {"type": "number", "default": 600, "description": "Total wall-clock time limit (seconds)."},
+            "max_model_calls": {"type": "integer", "default": 50, "description": "Maximum model calls allowed."},
             "cache_ttl_seconds": {"type": "integer", "default": CACHE_TTL},
             "force_refresh": {"type": "boolean", "default": False},
             "dry_run": {"type": "boolean", "default": False, "description": "Return budget/latency estimate and resolved orchestration plan without model calls."},
@@ -3721,8 +3730,8 @@ def handler(args=None, **_kw):
     namespace = f"omnicouncil:blackboard:{session_id}"
 
     # Provider data policy (P0 #6 fix)
-    provider_data_policy = str(args.get("provider_data_policy") or "internal")
-    implicit_http_fallback = _normalise_bool(args.get("implicit_http_fallback"), False)
+    provider_data_policy = str(args.get("provider_data_policy") or "public")
+    implicit_http_fallback = _normalise_bool(args.get("implicit_http_fallback"), True)
     
     # Run budget (P1 #7)
     budget = RunBudget(
@@ -4587,10 +4596,10 @@ def register(ctx):
         if callable(handler_fn):
             ctx.register_tool(name=schema["name"], toolset="hermes_omnicouncil", schema=schema, handler=handler_fn)
 
-    # ── Code Review tool registration
-    ctx.register_tool(
-        name="omnicouncil_code_review",
-        toolset="hermes_omnicouncil",
-        schema=CODE_REVIEW_SCHEMA,
-        handler=_handle_code_review,
-    )
+    # ── Code Review tool registration (DISABLED pending API rewrite — see fix/omnicouncil-runtime)
+    # ctx.register_tool(
+    #     name="omnicouncil_code_review",
+    #     toolset="hermes_omnicouncil",
+    #     schema=CODE_REVIEW_SCHEMA,
+    #     handler=_handle_code_review,
+    # )

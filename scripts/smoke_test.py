@@ -20,7 +20,7 @@ spec.loader.exec_module(mod)
 # ═══════════════════════════════════════════════════════════════
 # 1. Version & constants
 # ═══════════════════════════════════════════════════════════════
-assert mod.VERSION == "5.6.1-council-safe", f"VERSION={mod.VERSION}"
+assert mod.VERSION == "5.6.2-code-review", f"VERSION={mod.VERSION}"
 assert mod.DEFAULT_MAX_TOKENS == 384000
 assert mod.DEFAULT_JUDGE_MAX_TOKENS == 384000
 assert mod.MAX_CONTEXT_CHARS == 1_000_000
