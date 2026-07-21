@@ -684,7 +684,7 @@ SCHEMA = {
             "judge_max_tokens": {"type": "integer", "default": DEFAULT_JUDGE_MAX_TOKENS},
             "use_cache": {"type": "boolean", "default": True},
             "provider_data_policy": {"type": "string", "enum": ["confidential", "internal", "public"], "default": "public", "description": "Data policy for provider routing: confidential=local only, internal=local+trusted proxy, public=any configured provider."},
-            "implicit_http_fallback": {"type": "boolean", "default": true, "description": "Allow implicit HTTP provider fallback (backward compat)."},
+            "implicit_http_fallback": {"type": "boolean", "default": True, "description": "Allow implicit HTTP provider fallback (backward compat)."},
             "max_total_tokens": {"type": "integer", "default": 1_000_000, "description": "Total token budget for entire council run."},
             "max_cost_usd": {"type": "number", "default": 5.0, "description": "Total cost budget (USD)."},
             "max_wall_time_seconds": {"type": "number", "default": 600, "description": "Total wall-clock time limit (seconds)."},
