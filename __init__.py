@@ -524,6 +524,14 @@ COUNCIL_ALLOWED_TOOLS: set[str] = {
     "memory_wiki_add_task_capsule",
     "memory_wiki_post_task",
 
+    # Memory Wiki code claims (Phase 4)
+    "memory_wiki_code_claim_add",
+    "memory_wiki_code_claim_query",
+    "memory_wiki_symbol_history",
+    "memory_wiki_repository_context",
+    "memory_wiki_invalidate_revision",
+    "memory_wiki_patch_outcome_add",
+
     # File read only
     "read_file",
     "search_files",
@@ -533,6 +541,24 @@ COUNCIL_ALLOWED_TOOLS: set[str] = {
     "web_extract",
     "skills_list",
     "skill_view",
+
+    # Code Shrinker — read-only context tools (Phase 5)
+    "project.scan",
+    "project.map",
+    "project.snapshot",
+    "project.watch_status",
+    "project.changed_symbols",
+    "file.contracts",
+    "symbol.source",
+    "symbol.context",
+    "context.create",
+    "context.expand",
+    "context.inspect",
+    "artifact.get",
+    "artifact.get_chunk",
+    "artifact.copy_text",
+    "artifact.list",
+    "artifact.stats",
 }
 
 MUTATION_POLICY: dict[str, str] = {
@@ -1465,7 +1491,15 @@ def broker_tool_call(agent: str, tool_name: str, args: dict[str, Any]) -> dict[s
     _MEMORY_MUTATION_TOOLS = {
         "memory_wiki_add_claim", "memory_wiki_add_decision", "memory_wiki_add_evidence",
         "memory_wiki_add_entity", "memory_wiki_add_relation", "memory_wiki_update_claim",
-        "memory_wiki_post_task", "memory_wiki_add_task_capsule",
+        "memory_wiki_post_task",
+
+    # Memory Wiki code claims (Phase 4)
+    "memory_wiki_code_claim_add",
+    "memory_wiki_code_claim_query",
+    "memory_wiki_symbol_history",
+    "memory_wiki_repository_context",
+    "memory_wiki_invalidate_revision",
+    "memory_wiki_patch_outcome_add", "memory_wiki_add_task_capsule",
     }
     if run_ctx is None and tool_name in _MEMORY_MUTATION_TOOLS:
         return {
@@ -1484,6 +1518,14 @@ def broker_tool_call(agent: str, tool_name: str, args: dict[str, Any]) -> dict[s
     # Force blackboard namespace for memory_wiki writes
     if tool_name.startswith("memory_wiki_add_") or tool_name in {
         "memory_wiki_post_task",
+
+    # Memory Wiki code claims (Phase 4)
+    "memory_wiki_code_claim_add",
+    "memory_wiki_code_claim_query",
+    "memory_wiki_symbol_history",
+    "memory_wiki_repository_context",
+    "memory_wiki_invalidate_revision",
+    "memory_wiki_patch_outcome_add",
         "memory_wiki_write_firewall",
     }:
         if run_ctx is not None:
